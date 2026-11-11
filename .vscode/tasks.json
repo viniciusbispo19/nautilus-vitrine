@@ -1,0 +1,70 @@
+{
+  // Ctrl+Shift+P → "Tasks: Run Task" para ver estas tarefas.
+  // Ctrl+Shift+B roda a tarefa padrão (instalar em modo dev + reiniciar o Nautilus).
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Vitrine: instalar (modo dev, com links) e reiniciar Nautilus",
+      "type": "shell",
+      "command": "./install.sh --dev",
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "Vitrine: instalar (cópia definitiva)",
+      "type": "shell",
+      "command": "./install.sh",
+      "problemMatcher": []
+    },
+    {
+      "label": "Vitrine: reiniciar Nautilus",
+      "type": "shell",
+      "command": "nautilus -q; sleep 1; (setsid nautilus >/dev/null 2>&1 &)",
+      "problemMatcher": []
+    },
+    {
+      "label": "Vitrine: rodar Nautilus em modo depuração (log no terminal)",
+      "type": "shell",
+      "command": "nautilus -q; sleep 1; VITRINE_DEBUG=1 VITRINE_DUMP=1 nautilus",
+      "isBackground": true,
+      "problemMatcher": []
+    },
+    {
+      "label": "Vitrine: autoteste dentro do Nautilus (resultado no log)",
+      "type": "shell",
+      "command": "rm -f ~/.cache/nautilus-vitrine/vitrine.log; nautilus -q; sleep 1; (VITRINE_SELFTEST=1 setsid nautilus --new-window \"$HOME\" >/dev/null 2>&1 &); timeout 60 bash -c 'until grep -q \"SELFTEST RESUMO\" ~/.cache/nautilus-vitrine/vitrine.log 2>/dev/null; do sleep 2; done'; grep SELFTEST ~/.cache/nautilus-vitrine/vitrine.log",
+      "problemMatcher": []
+    },
+    {
+      "label": "Vitrine: acompanhar log",
+      "type": "shell",
+      "command": "mkdir -p ~/.cache/nautilus-vitrine && touch ~/.cache/nautilus-vitrine/vitrine.log && tail -n 80 -f ~/.cache/nautilus-vitrine/vitrine.log",
+      "isBackground": true,
+      "problemMatcher": []
+    },
+    {
+      "label": "Vitrine: teste fora do Nautilus (colunas + preview)",
+      "type": "shell",
+      "command": "python3 -u tools/smoke_test.py \"$(xdg-user-dir PICTURES)\"",
+      "problemMatcher": []
+    },
+    {
+      "label": "Vitrine: checar sintaxe",
+      "type": "shell",
+      "command": "python3 -m py_compile nautilus-vitrine.py vitrine/*.py tools/*.py && echo OK",
+      "problemMatcher": []
+    },
+    {
+      "label": "Vitrine: gerar script único criar-vitrine.sh",
+      "type": "shell",
+      "command": "python3 tools/build_bootstrap.py",
+      "problemMatcher": []
+    },
+    {
+      "label": "Vitrine: desinstalar",
+      "type": "shell",
+      "command": "./uninstall.sh",
+      "problemMatcher": []
+    }
+  ]
+}
