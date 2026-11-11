@@ -1,7 +1,7 @@
 %global extdir %{_datadir}/nautilus-python/extensions
 
 Name:           nautilus-vitrine
-Version:        0.1.0
+Version:        0.2.0
 Release:        1%{?dist}
 Summary:        Column view, preview pane and per-folder views for GNOME Files (Nautilus)
 
@@ -50,5 +50,9 @@ install -p -m 0644 vitrine/*.py %{buildroot}%{extdir}/vitrine/
 %{extdir}/vitrine/
 
 %changelog
+* Wed Nov 11 2026 Vinicius Bispo - 0.2.0-1
+- Página "Meu computador" com pastas, discos e uso de espaço
+- Aviso ao conectar pen drive, HD externo ou cartão, com botão Abrir
+
 * Wed Nov 11 2026 Vinicius Bispo - 0.1.0-1
 - Primeira versão: modo Colunas, painel de pré-visualização e visualização por pasta

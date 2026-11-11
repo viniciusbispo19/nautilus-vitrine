@@ -8,6 +8,7 @@ from gi.repository import Adw, Gdk, Gio, GLib, Gtk
 
 from . import native
 from .columns import ColumnStrip
+from .computer import ComputerPage
 from .preview import PreviewPane
 from .util import ancestor, debug, dump_tree, find_by_type_name, find_first, gtype_name, guarded, log
 
@@ -35,6 +36,11 @@ class WindowController:
         self._reveal_source = 0
         self._media_cache: dict[str, bool] = {}
         self.model_watch = native.ModelWatch(self._on_native_selection)
+        self.computer: ComputerPage | None = None
+        self.content_stack: Gtk.Stack | None = None
+        self.sidebar_list: Gtk.ListBox | None = None
+        self._computer_visible = False
+        self.toasts_shown = 0
 
     # ───────────────────────── injeção ─────────────────────────
     def inject(self) -> bool:
@@ -64,12 +70,20 @@ class WindowController:
         )
         self.preview.set_visible(bool(self.cfg.get("preview_visible")))
 
-        # [colunas | abas do Nautilus]  ‖  [pré-visualização]
+        self.computer = ComputerPage(self, self.ext.hub)
+
+        # [colunas | (abas do Nautilus ou Meu computador)]  ‖  [pré-visualização]
         inner = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
         toolbar.set_content(None)  # `tv` continua vivo: a referência Python o segura
         tv.set_hexpand(True)
+        self.content_stack = Gtk.Stack(hexpand=True, hhomogeneous=False, vhomogeneous=False)
+        self.content_stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
+        self.content_stack.set_transition_duration(120)
+        self.content_stack.add_named(tv, "tabs")
+        self.content_stack.add_named(self.computer, "computer")
+        self.content_stack.set_visible_child_name("tabs")
         inner.append(self.strip)
-        inner.append(tv)
+        inner.append(self.content_stack)
 
         self.paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
         self.paned.set_wide_handle(False)
@@ -84,6 +98,7 @@ class WindowController:
         toolbar.set_content(self.paned)
 
         self._inject_buttons()
+        self._inject_sidebar_row()
         self._install_keys()
 
         tv.connect("notify::selected-page", self._on_tab_switched)
@@ -105,7 +120,113 @@ class WindowController:
         slot = self.active_slot()
         if slot is not None:
             self._on_slot_location(slot)
+        if self.cfg.get("start_on_computer"):
+            self.show_computer(True)
         return GLib.SOURCE_REMOVE
+
+    def _inject_sidebar_row(self) -> None:
+        """Entrada "Meu computador" no topo da barra lateral.
+
+        Usa a API pública AdwToolbarView.add_top_bar da própria barra lateral: nenhum
+        widget do Nautilus é movido; a lista nativa de locais continua intocada."""
+        sidebar = find_by_type_name(self.win, "NautilusSidebar")
+        tbv = ancestor(sidebar, lambda w: isinstance(w, Adw.ToolbarView)) if sidebar else None
+        if tbv is None or tbv.get_content() is not sidebar:
+            log("inject: barra lateral com estrutura inesperada; sem a entrada Meu computador")
+            return
+        lb = Gtk.ListBox()
+        lb.add_css_class("navigation-sidebar")
+        lb.add_css_class("vitrine-sidebar")
+        lb.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        row = Gtk.ListBoxRow()
+        row.set_tooltip_text("Meu computador (Ctrl+Shift+C)")
+        box = Gtk.Box(spacing=12)
+        box.append(Gtk.Image.new_from_icon_name("computer-symbolic"))
+        box.append(Gtk.Label(label="Meu computador", xalign=0, hexpand=True))
+        row.set_child(box)
+        lb.append(row)
+        lb.connect("row-activated", lambda *_a: self.show_computer(True))
+        tbv.add_top_bar(lb)
+        self.sidebar_list = lb
+
+        # Clicar em qualquer local nativo da barra lateral sai do Meu computador,
+        # mesmo que seja a pasta onde a aba já está (aí o Nautilus não navega).
+        click = Gtk.GestureClick.new()
+        click.set_button(Gdk.BUTTON_PRIMARY)
+        click.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        click.connect("released", lambda *_a: GLib.idle_add(self._leave_computer_if_visible))
+        sidebar.add_controller(click)
+
+    def _leave_computer_if_visible(self) -> bool:
+        if self._computer_visible:
+            self.show_computer(False)
+        return GLib.SOURCE_REMOVE
+
+    # ───────────────────────── Meu computador ─────────────────────────
+    def show_computer(self, on: bool = True) -> None:
+        if self.content_stack is None or self.computer is None:
+            return
+        self._computer_visible = on
+        self.content_stack.set_visible_child_name("computer" if on else "tabs")
+        if on:
+            if self.strip is not None:
+                self.strip.set_visible(False)
+            if self.preview is not None:
+                self.preview.set_folder(None)
+                self.preview.show_uris([])
+            if self.sidebar_list is not None:
+                self.sidebar_list.select_row(self.sidebar_list.get_row_at_index(0))
+            sidebar = find_by_type_name(self.win, "NautilusSidebar")
+            native_lb = find_first(sidebar, lambda w: isinstance(w, Gtk.ListBox)) if sidebar else None
+            if native_lb is not None:
+                native_lb.unselect_all()
+            self.computer.grab_focus()
+        else:
+            if self.sidebar_list is not None:
+                self.sidebar_list.unselect_all()
+            slot = self.active_slot()
+            if slot is not None:
+                self._set_columns_visible(getattr(slot, "_vitrine_mode", None) == "columns")
+                self._sync_active_ui(slot)
+
+    def computer_visible(self) -> bool:
+        return self._computer_visible
+
+    def leave_computer_and_open(self, uri: str) -> None:
+        self.show_computer(False)
+        self.navigate(uri)
+
+    def preview_location(self, uri: str | None) -> None:
+        if self.preview is not None and self.preview.get_visible() and uri:
+            self.preview.show_uris([uri])
+
+    def toast(self, text: str, button_label: str | None = None, on_button=None,
+              timeout: int = 5) -> None:
+        overlay = find_first(self.win, lambda w: isinstance(w, Adw.ToastOverlay))
+        if overlay is None:
+            log(f"aviso (sem área de avisos): {text}")
+            return
+        t = Adw.Toast(title=GLib.markup_escape_text(text))
+        t.set_timeout(timeout)
+        if button_label and on_button is not None:
+            t.set_button_label(button_label)
+            t.connect("button-clicked", lambda *_a: on_button())
+        overlay.add_toast(t)
+        self.toasts_shown += 1
+
+    def on_new_device(self, key: str, name: str, mount, volume) -> None:
+        """Pen drive, HD externo, cartão… acabou de ser conectado."""
+
+        def open_device():
+            m = mount or (volume.get_mount() if volume is not None else None)
+            if m is not None:
+                self.leave_computer_and_open(m.get_default_location().get_uri())
+            elif volume is not None:
+                self.computer.mount_and_open(volume, key)
+
+        self.toast(f"{name} conectado", "Abrir", open_device, timeout=10)
+        if self.computer is not None:
+            self.computer.mark_new(key)
 
     def _inject_buttons(self) -> None:
         box = Gtk.Box(spacing=0)
@@ -143,6 +264,8 @@ class WindowController:
     def _on_key(self, _ctrl, keyval, _code, state) -> bool:
         mods = state & _MOD_MASK
         if mods == Gdk.ModifierType.CONTROL_MASK:
+            if keyval in (Gdk.KEY_1, Gdk.KEY_2, Gdk.KEY_3) and self._computer_visible:
+                self.show_computer(False)
             if keyval == Gdk.KEY_3:
                 self.user_set_mode("columns")
                 return True
@@ -151,10 +274,13 @@ class WindowController:
                 mode = "list" if keyval == Gdk.KEY_1 else "grid"
                 GLib.idle_add(self._after_native_key, mode)
                 return False
-        if mods == (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK) and keyval in (
-                Gdk.KEY_P, Gdk.KEY_p):
-            self.set_preview_visible(not self.preview.get_visible())
-            return True
+        if mods == (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK):
+            if keyval in (Gdk.KEY_P, Gdk.KEY_p):
+                self.set_preview_visible(not self.preview.get_visible())
+                return True
+            if keyval in (Gdk.KEY_C, Gdk.KEY_c):
+                self.show_computer(not self._computer_visible)
+                return True
         return False
 
     def _after_native_key(self, mode: str) -> bool:
@@ -179,6 +305,9 @@ class WindowController:
         slot = self.active_slot()
         if slot is None:
             return
+        if self._computer_visible:
+            self.show_computer(False)
+            return
         self._set_columns_visible(getattr(slot, "_vitrine_mode", None) == "columns")
         self._sync_active_ui(slot)
 
@@ -189,6 +318,8 @@ class WindowController:
             return
         self.ext.suppress()
         if slot is self.active_slot():
+            if self._computer_visible:
+                self.show_computer(False)  # navegou (barra de caminho, voltar, busca…)
             self._sync_active_ui(slot)
         GLib.idle_add(self._apply_rule_for_slot, slot, uri, priority=GLib.PRIORITY_LOW)
 
@@ -247,7 +378,7 @@ class WindowController:
 
     # ───────────────────────── seleção / pré-visualização ─────────────────────────
     def _on_native_selection(self, _model) -> None:
-        if self.preview is None or not self.preview.get_visible():
+        if self.preview is None or not self.preview.get_visible() or self._computer_visible:
             return
         self.preview.show_uris(lambda: native.selected_uris(self.model_watch.get()),
                                prefetch=lambda: native.neighbor_uris(self.model_watch.get()))
@@ -401,6 +532,8 @@ class WindowController:
                 ok = loc is not None and native.is_regular_location(loc.get_uri())
                 self.strip.set_location(loc if ok else None)
             else:
+                self.strip.set_visible(False)
+            if self._computer_visible:
                 self.strip.set_visible(False)
         self._sync_buttons()
 

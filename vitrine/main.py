@@ -14,11 +14,12 @@ gi.require_version("Nautilus", "4.1")
 from gi.repository import Gdk, Gio, GLib, GObject, Gtk, Nautilus  # noqa: E402
 
 from . import native  # noqa: E402
+from .computer import DeviceHub  # noqa: E402
 from .config import GRID_ZOOMS, Config  # noqa: E402
 from .util import guarded, log  # noqa: E402
 from .window import WindowController  # noqa: E402
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 CSS = b"""
 .vitrine-strip { background-color: var(--view-bg-color); }
@@ -26,6 +27,19 @@ CSS = b"""
 .vitrine-column listview.vitrine-list > row { margin: 1px 4px; padding: 4px 6px; }
 .vitrine-preview { background-color: var(--sidebar-bg-color); }
 .vitrine-picture { border-radius: 10px; }
+.vitrine-sidebar { background: transparent; padding-bottom: 0; }
+.vitrine-computer { background-color: var(--view-bg-color); }
+.vitrine-computer flowboxchild { padding: 0; border-radius: 12px; }
+.vitrine-tile { padding: 12px 8px; min-width: 96px; border-radius: 12px; }
+.vitrine-card { padding: 12px 14px; }
+.vitrine-computer flowboxchild:selected > .vitrine-card,
+.vitrine-card.vitrine-new { box-shadow: inset 0 0 0 2px var(--accent-bg-color); }
+levelbar.vitrine-usage trough { min-height: 6px; }
+levelbar.vitrine-usage block.vitrine-ok { background-color: var(--accent-bg-color); }
+levelbar.vitrine-usage block.vitrine-warn { background-color: var(--warning-bg-color); }
+levelbar.vitrine-usage block.vitrine-full { background-color: var(--error-bg-color); }
+.vitrine-badge { font-size: smaller; font-weight: bold; color: var(--accent-fg-color);
+  background-color: var(--accent-bg-color); border-radius: 99px; padding: 0 7px; }
 """
 
 
@@ -53,6 +67,8 @@ class VitrineExtension(GObject.GObject, Nautilus.MenuProvider):
         self._prefs = Gio.Settings.new("org.gnome.nautilus.preferences")
         self._icon_prefs = Gio.Settings.new("org.gnome.nautilus.icon-view")
         self._icon_prefs.connect("changed::default-zoom-level", self._on_zoom_changed)
+        self.hub = DeviceHub()
+        self.hub.on_new_device(self._on_new_device)
         log(f"Vitrine {VERSION} carregada")
         GLib.timeout_add(100, self._late_init)
 
@@ -121,6 +137,14 @@ class VitrineExtension(GObject.GObject, Nautilus.MenuProvider):
             ctl = next(iter(self.windows.values()))
         return ctl
 
+    def _on_new_device(self, key, name, mount, volume) -> None:
+        """Avisa só na janela ativa (evita um aviso repetido por janela aberta)."""
+        if not self.cfg.get("notify_new_devices"):
+            return
+        ctl = self.active_controller()
+        if ctl is not None:
+            ctl.on_new_device(key, name, mount, volume)
+
     # ── supressão: mudanças feitas por nós não contam como escolha do usuário ──
     def suppress(self, ms: int = 900) -> None:
         self._suppress_until = max(self._suppress_until, time.monotonic() + ms / 1000)
@@ -188,7 +212,11 @@ class VitrineExtension(GObject.GObject, Nautilus.MenuProvider):
         add("default", "Usar a visualização atual como padrão", self._make_default)
         add("preview", "Mostrar/ocultar pré-visualização (Ctrl+Shift+P)",
             lambda c: c.set_preview_visible(not c.preview.get_visible()))
-        return [root]
+
+        computer = Nautilus.MenuItem(name="Vitrine::computer", label="Meu computador")
+        computer.connect("activate", lambda *_a: GLib.idle_add(
+            self._run, lambda c: c.show_computer(True)))
+        return [root, computer]
 
     def _run(self, cb) -> bool:
         ctl = self.active_controller()

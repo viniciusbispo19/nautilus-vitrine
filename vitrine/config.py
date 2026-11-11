@@ -30,6 +30,10 @@ DEFAULT_SETTINGS = {
     "auto_media_grid": True,
     "auto_media_zoom": "extra-large",
     "auto_media_ratio": 0.6,
+    # Abrir o Nautilus já na página "Meu computador".
+    "start_on_computer": False,
+    # Avisar (com botão "Abrir") quando um pen drive/HD externo/cartão for conectado.
+    "notify_new_devices": True,
     # Visualização para pastas sem regra. None = capturar do Nautilus na 1ª execução.
     "default_mode": None,
     "default_grid_zoom": None,

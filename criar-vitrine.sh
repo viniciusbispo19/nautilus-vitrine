@@ -503,7 +503,574 @@ class ColumnStrip(Gtk.Box):
         return GLib.SOURCE_REMOVE
 __VITRINE_ARQUIVO_2__
 mkdir -p "vitrine"
-cat > 'vitrine/config.py' <<'__VITRINE_ARQUIVO_3__'
+cat > 'vitrine/computer.py' <<'__VITRINE_ARQUIVO_3__'
+"""Página "Meu computador": pastas, discos e dispositivos (com uso de espaço) e
+aviso quando um pen drive, HD externo, cartão ou celular é conectado."""
+
+from __future__ import annotations
+
+import os
+import socket
+import time
+
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk, Pango
+
+from . import util
+from .util import guarded, log
+
+FS_ATTRS = "filesystem::size,filesystem::free,filesystem::type,filesystem::readonly"
+USAGE_REFRESH_S = 10
+ANNOUNCE_DEDUP_S = 15
+
+FOLDERS = (
+    (None, "user-home", "Pasta pessoal"),
+    (GLib.UserDirectory.DIRECTORY_DESKTOP, "user-desktop", None),
+    (GLib.UserDirectory.DIRECTORY_DOCUMENTS, "folder-documents", None),
+    (GLib.UserDirectory.DIRECTORY_DOWNLOAD, "folder-download", None),
+    (GLib.UserDirectory.DIRECTORY_MUSIC, "folder-music", None),
+    (GLib.UserDirectory.DIRECTORY_PICTURES, "folder-pictures", None),
+    (GLib.UserDirectory.DIRECTORY_VIDEOS, "folder-videos", None),
+)
+
+
+def _os_name() -> str:
+    try:
+        with open("/etc/os-release", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("PRETTY_NAME="):
+                    return line.split("=", 1)[1].strip().strip('"')
+    except OSError:
+        pass
+    return "Linux"
+
+
+class Device:
+    """Uma entrada da seção de dispositivos (já montada ou não)."""
+
+    __slots__ = ("key", "name", "gicon", "uri", "kind", "mount", "volume", "removable")
+
+    def __init__(self, key, name, gicon, uri, kind, mount=None, volume=None, removable=False):
+        self.key, self.name, self.gicon, self.uri = key, name, gicon, uri
+        self.kind, self.mount, self.volume, self.removable = kind, mount, volume, removable
+
+    @property
+    def mounted(self) -> bool:
+        return self.uri is not None
+
+    def can_eject(self) -> bool:
+        m = self.mount
+        return m is not None and (m.can_eject() or m.can_unmount())
+
+
+def _volume_key(volume: Gio.Volume) -> str:
+    for kind in (Gio.VOLUME_IDENTIFIER_KIND_UUID, Gio.VOLUME_IDENTIFIER_KIND_UNIX_DEVICE):
+        ident = volume.get_identifier(kind)
+        if ident:
+            return f"vol:{ident}"
+    return f"vol:{volume.get_name()}"
+
+
+def _is_removable(mount: Gio.Mount | None, volume: Gio.Volume | None) -> bool:
+    drive = (volume.get_drive() if volume is not None else None) or (
+        mount.get_drive() if mount is not None else None)
+    if drive is not None:
+        try:
+            if drive.is_removable() or drive.is_media_removable():
+                return True
+        except AttributeError:
+            pass
+    return bool(mount is not None and mount.can_eject())
+
+
+class DeviceHub:
+    """Observa o Gio.VolumeMonitor uma vez por processo e avisa os ouvintes."""
+
+    def __init__(self) -> None:
+        self.vm = Gio.VolumeMonitor.get()
+        self._listeners: list = []
+        self._new_listeners: list = []
+        self._pending = 0
+        self._announced: dict[str, float] = {}
+        self.own_mounts: set[str] = set()  # montagens que nós mesmos pedimos
+        for sig in ("mount-changed", "mount-removed", "volume-changed", "volume-removed",
+                    "drive-connected", "drive-disconnected", "drive-changed"):
+            self.vm.connect(sig, lambda *_a: self._changed())
+        self.vm.connect("volume-added", self._on_volume_added)
+        self.vm.connect("mount-added", self._on_mount_added)
+
+    def on_changed(self, cb) -> None:
+        self._listeners.append(cb)
+
+    def on_new_device(self, cb) -> None:
+        self._new_listeners.append(cb)
+
+    def _changed(self) -> None:
+        if self._pending:
+            return
+        self._pending = GLib.timeout_add(150, self._emit)
+
+    def _emit(self) -> bool:
+        self._pending = 0
+        for cb in list(self._listeners):
+            try:
+                cb()
+            except Exception as err:  # noqa: BLE001
+                log(f"DeviceHub ouvinte: {err}")
+        return GLib.SOURCE_REMOVE
+
+    # ── novos dispositivos ──
+    @guarded
+    def _on_volume_added(self, _vm, volume: Gio.Volume) -> None:
+        self._changed()
+        if _is_removable(None, volume):
+            self.announce(_volume_key(volume), volume.get_name(), volume=volume)
+
+    @guarded
+    def _on_mount_added(self, _vm, mount: Gio.Mount) -> None:
+        self._changed()
+        volume = mount.get_volume()
+        key = _volume_key(volume) if volume is not None else f"mnt:{mount.get_root().get_uri()}"
+        if key in self.own_mounts:
+            self.own_mounts.discard(key)
+            return
+        if mount.is_shadowed() or not _is_removable(mount, volume):
+            return
+        self.announce(key, mount.get_name(), mount=mount, volume=volume)
+
+    def announce(self, key: str, name: str, *, mount=None, volume=None) -> None:
+        now = time.monotonic()
+        last = self._announced.get(key, 0)
+        self._announced[key] = now
+        if now - last < ANNOUNCE_DEDUP_S:
+            return  # mesmo dispositivo (ex.: volume-added seguido de mount-added)
+        log(f"novo dispositivo: {name} ({key})")
+        for cb in list(self._new_listeners):
+            try:
+                cb(key, name, mount, volume)
+            except Exception as err:  # noqa: BLE001
+                log(f"DeviceHub novo dispositivo: {err}")
+
+    # ── lista atual ──
+    def devices(self) -> list[Device]:
+        out = [Device("system:/", "Disco do sistema", Gio.ThemedIcon.new("drive-harddisk"),
+                      "file:///", "system")]
+        seen_volumes = set()
+        for mount in self.vm.get_mounts():
+            if mount.is_shadowed():
+                continue
+            volume = mount.get_volume()
+            root = mount.get_root()
+            uri = root.get_uri()
+            scheme = GLib.Uri.peek_scheme(uri) or ""
+            if volume is not None:
+                seen_volumes.add(_volume_key(volume))
+            removable = _is_removable(mount, volume)
+            kind = "network" if scheme not in ("file", "") else ("removable" if removable else "internal")
+            key = _volume_key(volume) if volume is not None else f"mnt:{uri}"
+            out.append(Device(key, mount.get_name(), mount.get_icon(), uri, kind, mount, volume,
+                              removable))
+        for volume in self.vm.get_volumes():
+            key = _volume_key(volume)
+            if volume.get_mount() is not None or key in seen_volumes or not volume.can_mount():
+                continue
+            removable = _is_removable(None, volume)
+            out.append(Device(key, volume.get_name(), volume.get_icon(), None,
+                              "removable" if removable else "internal", None, volume, removable))
+        return out
+
+
+class ComputerPage(Gtk.ScrolledWindow):
+    __gtype_name__ = "VitrineComputerPage"
+
+    def __init__(self, ctl, hub: DeviceHub) -> None:
+        super().__init__()
+        self.ctl = ctl
+        self.hub = hub
+        self.add_css_class("vitrine-computer")
+        self.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self._cards: dict[str, Gtk.FlowBoxChild] = {}
+        self._new_keys: dict[str, float] = {}
+        self._usage_source = 0
+        self._dirty = True
+        self._cancel = Gio.Cancellable()
+        self._nautilus_prefs = Gio.Settings.new("org.gnome.nautilus.preferences")
+
+        clamp = Adw.Clamp(maximum_size=1100, tightening_threshold=700)
+        self.set_child(clamp)
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
+        body.set_margin_top(24)
+        body.set_margin_bottom(24)
+        body.set_margin_start(18)
+        body.set_margin_end(18)
+        clamp.set_child(body)
+
+        title = Gtk.Label(label="Meu computador", xalign=0)
+        title.add_css_class("title-1")
+        subtitle = Gtk.Label(label=f"{socket.gethostname()} · {_os_name()}", xalign=0)
+        subtitle.add_css_class("dim-label")
+        head = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        head.append(title)
+        head.append(subtitle)
+        body.append(head)
+
+        self.folders_box = self._flowbox(max_per_line=8)
+        body.append(self._section("Pastas", self.folders_box))
+        self.devices_box = self._flowbox(max_per_line=4)
+        body.append(self._section("Dispositivos e unidades", self.devices_box))
+        self.network_box = self._flowbox(max_per_line=4)
+        self.network_section = self._section("Rede", self.network_box)
+        body.append(self.network_section)
+
+        if GLib.find_program_in_path("gnome-disks"):
+            disks = Gtk.Button(label="Abrir Discos (formatar, partições…)", halign=Gtk.Align.START)
+            disks.add_css_class("flat")
+            disks.connect("clicked", lambda *_: self._launch("gnome-disks"))
+            body.append(disks)
+
+        hub.on_changed(self._on_hub_changed)
+        self.connect("map", lambda *_: self._on_map())
+        self.connect("unmap", lambda *_: self._stop_usage_poll())
+
+    # ── montagem da página ──
+    def _section(self, title: str, child: Gtk.Widget) -> Gtk.Widget:
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        lbl = Gtk.Label(label=title, xalign=0)
+        lbl.add_css_class("heading")
+        box.append(lbl)
+        box.append(child)
+        return box
+
+    def _flowbox(self, *, max_per_line: int) -> Gtk.FlowBox:
+        fb = Gtk.FlowBox()
+        fb.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        fb.set_max_children_per_line(max_per_line)
+        fb.set_min_children_per_line(1)
+        fb.set_column_spacing(10)
+        fb.set_row_spacing(10)
+        fb.set_homogeneous(False)
+        fb.set_valign(Gtk.Align.START)
+        fb.connect("child-activated", self._on_activated)
+        fb.connect("selected-children-changed", self._on_selected)
+        return fb
+
+    def _on_map(self) -> None:
+        single = self._nautilus_prefs.get_string("click-policy") == "single"
+        for fb in (self.folders_box, self.devices_box, self.network_box):
+            fb.set_activate_on_single_click(single)
+        if self._dirty:
+            self.refresh()
+        else:
+            self._refresh_usage()
+        self._start_usage_poll()
+
+    def _on_hub_changed(self) -> None:
+        self._dirty = True
+        if self.get_mapped():
+            self.refresh()
+
+    def refresh(self) -> None:
+        self._dirty = False
+        self._cancel.cancel()
+        self._cancel = Gio.Cancellable()
+        for fb in (self.folders_box, self.devices_box, self.network_box):
+            fb.remove_all()
+        self._cards.clear()
+
+        for special, icon, label in FOLDERS:
+            path = os.path.expanduser("~") if special is None else GLib.get_user_special_dir(special)
+            if not path or not os.path.isdir(path):
+                continue
+            if special is not None and os.path.realpath(path) == os.path.realpath(os.path.expanduser("~")):
+                continue
+            self.folders_box.append(self._folder_tile(
+                Gio.File.new_for_path(path).get_uri(), icon, label or os.path.basename(path)))
+
+        n_net = 0
+        for dev in self.hub.devices():
+            child = self._device_card(dev)
+            self._cards[dev.key] = child
+            if dev.kind == "network":
+                self.network_box.append(child)
+                n_net += 1
+            else:
+                self.devices_box.append(child)
+        self.network_section.set_visible(n_net > 0)
+        self._refresh_usage()
+
+    def _folder_tile(self, uri: str, icon: str, label: str) -> Gtk.FlowBoxChild:
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box.add_css_class("vitrine-tile")
+        img = Gtk.Image.new_from_icon_name(icon)
+        img.set_pixel_size(48)
+        lbl = Gtk.Label(label=label, ellipsize=Pango.EllipsizeMode.END, max_width_chars=12)
+        box.append(img)
+        box.append(lbl)
+        child = Gtk.FlowBoxChild()
+        child.set_child(box)
+        child._vitrine_uri = uri
+        child._vitrine_device = None
+        self._add_context_menu(child)
+        return child
+
+    def _device_card(self, dev: Device) -> Gtk.FlowBoxChild:
+        card = Gtk.Box(spacing=12)
+        card.add_css_class("card")
+        card.add_css_class("vitrine-card")
+        card.set_size_request(300, -1)
+        img = Gtk.Image()
+        if dev.gicon is not None:
+            img.set_from_gicon(dev.gicon)
+        img.set_pixel_size(48)
+        card.append(img)
+
+        info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, hexpand=True,
+                       valign=Gtk.Align.CENTER)
+        top = Gtk.Box(spacing=6)
+        name = Gtk.Label(label=dev.name, xalign=0, ellipsize=Pango.EllipsizeMode.END)
+        name.add_css_class("heading")
+        top.append(name)
+        badge = Gtk.Label(label="Novo")
+        badge.add_css_class("vitrine-badge")
+        badge.set_visible(dev.key in self._new_keys)
+        top.append(badge)
+        info.append(top)
+        bar = Gtk.LevelBar(min_value=0, max_value=1)
+        bar.add_css_class("vitrine-usage")
+        for off in ("low", "high", "full"):
+            bar.remove_offset_value(off)
+        bar.add_offset_value("vitrine-ok", 0.80)
+        bar.add_offset_value("vitrine-warn", 0.92)
+        bar.add_offset_value("vitrine-full", 1.0)
+        bar.set_visible(dev.mounted)
+        info.append(bar)
+        detail = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END)
+        detail.add_css_class("dim-label")
+        detail.add_css_class("caption")
+        detail.set_text("Calculando…" if dev.mounted else "Não montado. Abra para montar")
+        info.append(detail)
+        card.append(info)
+
+        if dev.can_eject():
+            eject = Gtk.Button(icon_name="media-eject-symbolic", valign=Gtk.Align.CENTER)
+            eject.add_css_class("flat")
+            eject.add_css_class("circular")
+            eject.set_tooltip_text("Remover com segurança" if dev.removable else "Desmontar")
+            eject.connect("clicked", lambda *_a, d=dev: self.eject(d))
+            card.append(eject)
+
+        child = Gtk.FlowBoxChild()
+        child.set_child(card)
+        child._vitrine_uri = dev.uri
+        child._vitrine_device = dev
+        child._vitrine_bar = bar
+        child._vitrine_detail = detail
+        child._vitrine_badge = badge
+        if dev.key in self._new_keys:
+            card.add_css_class("vitrine-new")
+        self._add_context_menu(child)
+        return child
+
+    # ── uso de espaço ──
+    def _refresh_usage(self) -> None:
+        for child in list(self._cards.values()):
+            dev = child._vitrine_device
+            if dev is None or not dev.mounted:
+                continue
+            Gio.File.new_for_uri(dev.uri).query_filesystem_info_async(
+                FS_ATTRS, GLib.PRIORITY_LOW, self._cancel, self._on_fs_info, child)
+
+    @guarded
+    def _on_fs_info(self, gfile, result, child) -> None:
+        try:
+            info = gfile.query_filesystem_info_finish(result)
+        except GLib.Error:
+            child._vitrine_detail.set_text(child._vitrine_device.uri or "")
+            child._vitrine_bar.set_visible(False)
+            return
+        size = info.get_attribute_uint64("filesystem::size")
+        free = info.get_attribute_uint64("filesystem::free")
+        fstype = info.get_attribute_string("filesystem::type") or ""
+        if size <= 0:
+            child._vitrine_bar.set_visible(False)
+            child._vitrine_detail.set_text(fstype or "—")
+            return
+        child._vitrine_bar.set_value(max(0.0, min(1.0, (size - free) / size)))
+        text = f"{util.human_size(free)} livres de {util.human_size(size)}"
+        if fstype:
+            text += f" · {fstype}"
+        child._vitrine_detail.set_text(text)
+
+    def _start_usage_poll(self) -> None:
+        if not self._usage_source:
+            self._usage_source = GLib.timeout_add_seconds(USAGE_REFRESH_S, self._poll_usage)
+
+    def _stop_usage_poll(self) -> None:
+        if self._usage_source:
+            GLib.source_remove(self._usage_source)
+            self._usage_source = 0
+
+    def _poll_usage(self) -> bool:
+        if not self.get_mapped():
+            self._usage_source = 0
+            return GLib.SOURCE_REMOVE
+        self._refresh_usage()
+        return GLib.SOURCE_CONTINUE
+
+    # ── novos dispositivos ──
+    def mark_new(self, key: str) -> None:
+        """Destaca e seleciona o card de um dispositivo recém-conectado."""
+        self._new_keys[key] = time.monotonic()
+        GLib.timeout_add_seconds(30, self._unmark, key)
+        if self._dirty or key not in self._cards:
+            self.refresh()
+        child = self._cards.get(key)
+        if child is not None:
+            child.get_child().add_css_class("vitrine-new")
+            child._vitrine_badge.set_visible(True)
+            self.devices_box.select_child(child)
+            if self.get_mapped():
+                child.grab_focus()
+
+    def _unmark(self, key: str) -> bool:
+        self._new_keys.pop(key, None)
+        child = self._cards.get(key)
+        if child is not None:
+            child.get_child().remove_css_class("vitrine-new")
+            child._vitrine_badge.set_visible(False)
+        return GLib.SOURCE_REMOVE
+
+    # ── ações ──
+    @guarded
+    def _on_activated(self, _fb, child) -> None:
+        self.open_child(child)
+
+    @guarded
+    def _on_selected(self, fb) -> None:
+        sel = fb.get_selected_children()
+        if not sel:
+            return
+        for other in (self.folders_box, self.devices_box, self.network_box):
+            if other is not fb:
+                other.unselect_all()
+        uri = getattr(sel[0], "_vitrine_uri", None)
+        self.ctl.preview_location(uri)
+
+    def open_child(self, child, *, new_window: bool = False) -> None:
+        dev = getattr(child, "_vitrine_device", None)
+        uri = getattr(child, "_vitrine_uri", None)
+        if uri:
+            self._open_uri(uri, new_window)
+        elif dev is not None and dev.volume is not None:
+            self.mount_and_open(dev.volume, dev.key, new_window=new_window)
+
+    def _open_uri(self, uri: str, new_window: bool) -> None:
+        if new_window:
+            util.show_in_new_window(uri)
+        else:
+            self.ctl.leave_computer_and_open(uri)
+
+    def mount_and_open(self, volume: Gio.Volume, key: str, *, new_window: bool = False) -> None:
+        mount = volume.get_mount()
+        if mount is not None:
+            self._open_uri(mount.get_default_location().get_uri(), new_window)
+            return
+        self.hub.own_mounts.add(key)
+        op = Gtk.MountOperation.new(self.get_root())
+
+        def done(vol, result):
+            try:
+                vol.mount_finish(result)
+            except GLib.Error as err:
+                self.hub.own_mounts.discard(key)
+                if not err.matches(Gio.io_error_quark(), Gio.IOErrorEnum.FAILED_HANDLED):
+                    self.ctl.toast(f"Não foi possível montar {vol.get_name()}: {err.message}")
+                return
+            m = vol.get_mount()
+            if m is not None:
+                self._open_uri(m.get_default_location().get_uri(), new_window)
+
+        volume.mount(Gio.MountMountFlags.NONE, op, None, done)
+
+    def eject(self, dev: Device) -> None:
+        mount = dev.mount
+        if mount is None:
+            return
+        op = Gtk.MountOperation.new(self.get_root())
+        name = dev.name
+
+        def done(m, result, ejecting):
+            try:
+                if ejecting:
+                    m.eject_with_operation_finish(result)
+                else:
+                    m.unmount_with_operation_finish(result)
+            except GLib.Error as err:
+                if not err.matches(Gio.io_error_quark(), Gio.IOErrorEnum.FAILED_HANDLED):
+                    self.ctl.toast(f"Não foi possível remover {name}: {err.message}")
+                return
+            self.ctl.toast(f"{name} pode ser removido com segurança" if ejecting
+                           else f"{name} foi desmontado")
+
+        if mount.can_eject():
+            mount.eject_with_operation(Gio.MountUnmountFlags.NONE, op, None, done, True)
+        else:
+            mount.unmount_with_operation(Gio.MountUnmountFlags.NONE, op, None, done, False)
+
+    def _launch(self, program: str) -> None:
+        try:
+            Gio.AppInfo.create_from_commandline(program, None, Gio.AppInfoCreateFlags.NONE).launch(
+                [], None)
+        except GLib.Error as err:
+            log(f"não foi possível abrir {program}: {err.message}")
+
+    # ── menu de contexto ──
+    def _add_context_menu(self, child: Gtk.FlowBoxChild) -> None:
+        gesture = Gtk.GestureClick.new()
+        gesture.set_button(Gdk.BUTTON_SECONDARY)
+        gesture.connect("pressed", self._on_right_click, child)
+        child.add_controller(gesture)
+
+    @guarded
+    def _on_right_click(self, gesture, _n, x, y, child) -> None:
+        gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+        dev = child._vitrine_device
+        uri = child._vitrine_uri
+        group = Gio.SimpleActionGroup()
+        menu = Gio.Menu()
+        top = Gio.Menu()
+
+        def add(section, label, name, fn):
+            act = Gio.SimpleAction.new(name, None)
+            act.connect("activate", lambda *_a: fn())
+            group.add_action(act)
+            section.append(label, f"vcomp.{name}")
+
+        add(top, "Abrir" if uri else "Montar e abrir", "open", lambda: self.open_child(child))
+        add(top, "Abrir em nova janela", "new-window",
+            lambda: self.open_child(child, new_window=True))
+        menu.append_section(None, top)
+        if uri:
+            mid = Gio.Menu()
+            path = Gio.File.new_for_uri(uri).get_path() or uri
+            add(mid, "Copiar caminho", "copy", lambda: util.copy_text_to_clipboard(child, path))
+            menu.append_section(None, mid)
+        if dev is not None and dev.can_eject():
+            end = Gio.Menu()
+            add(end, "Remover com segurança" if dev.mount.can_eject() else "Desmontar", "eject",
+                lambda: self.eject(dev))
+            menu.append_section(None, end)
+        child.insert_action_group("vcomp", group)
+        pop = Gtk.PopoverMenu.new_from_model(menu)
+        pop.set_parent(child)
+        pop.set_has_arrow(False)
+        rect = Gdk.Rectangle()
+        rect.x, rect.y, rect.width, rect.height = int(x), int(y), 1, 1
+        pop.set_pointing_to(rect)
+        pop.connect("closed", lambda p: GLib.idle_add(p.unparent))
+        pop.popup()
+__VITRINE_ARQUIVO_3__
+mkdir -p "vitrine"
+cat > 'vitrine/config.py' <<'__VITRINE_ARQUIVO_4__'
 """Preferências e regras de visualização por pasta (JSON em ~/.config/nautilus-vitrine)."""
 
 from __future__ import annotations
@@ -536,6 +1103,10 @@ DEFAULT_SETTINGS = {
     "auto_media_grid": True,
     "auto_media_zoom": "extra-large",
     "auto_media_ratio": 0.6,
+    # Abrir o Nautilus já na página "Meu computador".
+    "start_on_computer": False,
+    # Avisar (com botão "Abrir") quando um pen drive/HD externo/cartão for conectado.
+    "notify_new_devices": True,
     # Visualização para pastas sem regra. None = capturar do Nautilus na 1ª execução.
     "default_mode": None,
     "default_grid_zoom": None,
@@ -663,9 +1234,9 @@ class Config:
         except OSError as err:
             log(f"config: falha ao salvar ({err})")
         return GLib.SOURCE_REMOVE
-__VITRINE_ARQUIVO_3__
+__VITRINE_ARQUIVO_4__
 mkdir -p "vitrine"
-cat > 'vitrine/imageload.py' <<'__VITRINE_ARQUIVO_4__'
+cat > 'vitrine/imageload.py' <<'__VITRINE_ARQUIVO_5__'
 """Carregamento rápido de imagens para o preview.
 
 No Fedora 45 o gdk-pixbuf usa o glycin, que abre um processo isolado (sandbox)
@@ -848,9 +1419,9 @@ THUMB_ATTRS = ",".join(
     for s in ("", "-normal", "-large", "-xlarge", "-xxlarge")
     for k in ("path", "is-valid")
 )
-__VITRINE_ARQUIVO_4__
+__VITRINE_ARQUIVO_5__
 mkdir -p "vitrine"
-cat > 'vitrine/main.py' <<'__VITRINE_ARQUIVO_5__'
+cat > 'vitrine/main.py' <<'__VITRINE_ARQUIVO_6__'
 """Ponto central: descobre as janelas do Nautilus e oferece o menu "Visualização desta pasta"."""
 
 from __future__ import annotations
@@ -867,11 +1438,12 @@ gi.require_version("Nautilus", "4.1")
 from gi.repository import Gdk, Gio, GLib, GObject, Gtk, Nautilus  # noqa: E402
 
 from . import native  # noqa: E402
+from .computer import DeviceHub  # noqa: E402
 from .config import GRID_ZOOMS, Config  # noqa: E402
 from .util import guarded, log  # noqa: E402
 from .window import WindowController  # noqa: E402
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 CSS = b"""
 .vitrine-strip { background-color: var(--view-bg-color); }
@@ -879,6 +1451,19 @@ CSS = b"""
 .vitrine-column listview.vitrine-list > row { margin: 1px 4px; padding: 4px 6px; }
 .vitrine-preview { background-color: var(--sidebar-bg-color); }
 .vitrine-picture { border-radius: 10px; }
+.vitrine-sidebar { background: transparent; padding-bottom: 0; }
+.vitrine-computer { background-color: var(--view-bg-color); }
+.vitrine-computer flowboxchild { padding: 0; border-radius: 12px; }
+.vitrine-tile { padding: 12px 8px; min-width: 96px; border-radius: 12px; }
+.vitrine-card { padding: 12px 14px; }
+.vitrine-computer flowboxchild:selected > .vitrine-card,
+.vitrine-card.vitrine-new { box-shadow: inset 0 0 0 2px var(--accent-bg-color); }
+levelbar.vitrine-usage trough { min-height: 6px; }
+levelbar.vitrine-usage block.vitrine-ok { background-color: var(--accent-bg-color); }
+levelbar.vitrine-usage block.vitrine-warn { background-color: var(--warning-bg-color); }
+levelbar.vitrine-usage block.vitrine-full { background-color: var(--error-bg-color); }
+.vitrine-badge { font-size: smaller; font-weight: bold; color: var(--accent-fg-color);
+  background-color: var(--accent-bg-color); border-radius: 99px; padding: 0 7px; }
 """
 
 
@@ -906,6 +1491,8 @@ class VitrineExtension(GObject.GObject, Nautilus.MenuProvider):
         self._prefs = Gio.Settings.new("org.gnome.nautilus.preferences")
         self._icon_prefs = Gio.Settings.new("org.gnome.nautilus.icon-view")
         self._icon_prefs.connect("changed::default-zoom-level", self._on_zoom_changed)
+        self.hub = DeviceHub()
+        self.hub.on_new_device(self._on_new_device)
         log(f"Vitrine {VERSION} carregada")
         GLib.timeout_add(100, self._late_init)
 
@@ -974,6 +1561,14 @@ class VitrineExtension(GObject.GObject, Nautilus.MenuProvider):
             ctl = next(iter(self.windows.values()))
         return ctl
 
+    def _on_new_device(self, key, name, mount, volume) -> None:
+        """Avisa só na janela ativa (evita um aviso repetido por janela aberta)."""
+        if not self.cfg.get("notify_new_devices"):
+            return
+        ctl = self.active_controller()
+        if ctl is not None:
+            ctl.on_new_device(key, name, mount, volume)
+
     # ── supressão: mudanças feitas por nós não contam como escolha do usuário ──
     def suppress(self, ms: int = 900) -> None:
         self._suppress_until = max(self._suppress_until, time.monotonic() + ms / 1000)
@@ -1041,7 +1636,11 @@ class VitrineExtension(GObject.GObject, Nautilus.MenuProvider):
         add("default", "Usar a visualização atual como padrão", self._make_default)
         add("preview", "Mostrar/ocultar pré-visualização (Ctrl+Shift+P)",
             lambda c: c.set_preview_visible(not c.preview.get_visible()))
-        return [root]
+
+        computer = Nautilus.MenuItem(name="Vitrine::computer", label="Meu computador")
+        computer.connect("activate", lambda *_a: GLib.idle_add(
+            self._run, lambda c: c.show_computer(True)))
+        return [root, computer]
 
     def _run(self, cb) -> bool:
         ctl = self.active_controller()
@@ -1066,9 +1665,9 @@ class VitrineExtension(GObject.GObject, Nautilus.MenuProvider):
         if mode == "grid":
             self.cfg.set("default_grid_zoom", self.current_grid_zoom())
         log(f"novo padrão: {mode}")
-__VITRINE_ARQUIVO_5__
+__VITRINE_ARQUIVO_6__
 mkdir -p "vitrine"
-cat > 'vitrine/native.py' <<'__VITRINE_ARQUIVO_6__'
+cat > 'vitrine/native.py' <<'__VITRINE_ARQUIVO_7__'
 """Ponte com as partes internas do Nautilus (aba/slot, modo de visualização, seleção).
 
 Regra de ouro: nunca guardar referência forte a widgets ou modelos do Nautilus.
@@ -1283,9 +1882,9 @@ class ModelWatch:
             self._callback(model)
         except Exception as err:  # noqa: BLE001
             log(f"ModelWatch callback: {err}")
-__VITRINE_ARQUIVO_6__
+__VITRINE_ARQUIVO_7__
 mkdir -p "vitrine"
-cat > 'vitrine/preview.py' <<'__VITRINE_ARQUIVO_7__'
+cat > 'vitrine/preview.py' <<'__VITRINE_ARQUIVO_8__'
 """Painel de pré-visualização à direita: imagem, texto, miniatura de vídeo/PDF e informações."""
 
 from __future__ import annotations
@@ -1810,9 +2409,9 @@ class PreviewPane(Gtk.Box):
             self._on_navigate(self._current_uri)
         else:
             util.open_uri(self._current_uri)
-__VITRINE_ARQUIVO_7__
+__VITRINE_ARQUIVO_8__
 mkdir -p "vitrine"
-cat > 'vitrine/selftest.py' <<'__VITRINE_ARQUIVO_8__'
+cat > 'vitrine/selftest.py' <<'__VITRINE_ARQUIVO_9__'
 """Autoteste dentro do Nautilus real. Só roda com VITRINE_SELFTEST=1.
 
 Navega por pastas, troca modos, seleciona arquivos e grava PASSOU/FALHOU no log.
@@ -1882,6 +2481,19 @@ def run(ctl) -> bool:
     saved_folders = copy.deepcopy(cfg.folders)
     saved_settings = copy.deepcopy(cfg.settings)
     saved_zoom = ctl.ext.current_grid_zoom()
+    # Roda com regras padrão (as suas ficam num backup e voltam no fim).
+    try:
+        import json
+
+        from .config import FOLDERS_PATH
+        with open(FOLDERS_PATH + ".selftest-backup", "w", encoding="utf-8") as fh:
+            json.dump(saved_folders, fh, indent=2, ensure_ascii=False)
+    except OSError:
+        pass
+    cfg.folders.clear()
+    cfg._seed_pictures_rule()
+    cfg.settings["default_mode"] = "list"
+    cfg.settings["start_on_computer"] = False
     home = Gio.File.new_for_path(os.path.expanduser("~")).get_uri()
     pictures = GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_PICTURES)
     pictures_uri = Gio.File.new_for_path(pictures).get_uri() if pictures else None
@@ -2022,6 +2634,67 @@ def run(ctl) -> bool:
         ctl.navigate(home)
 
     @step
+    def c1():
+        ctl.show_computer(True)
+
+    @step
+    def c2():
+        page = ctl.computer
+        tiles = 0
+        child = page.folders_box.get_first_child()
+        while child is not None:
+            tiles += 1
+            child = child.get_next_sibling()
+        system = page._cards.get("system:/")
+        detail = system._vitrine_detail.get_text() if system is not None else ""
+        check("Meu computador abre (Ctrl+Shift+C / barra lateral)",
+              ctl.content_stack.get_visible_child_name() == "computer"
+              and ctl.sidebar_list is not None
+              and ctl.sidebar_list.get_selected_row() is not None,
+              f"página={ctl.content_stack.get_visible_child_name()} sidebar={ctl.sidebar_list is not None}")
+        check("pastas pessoais aparecem", tiles >= 5, f"{tiles} pastas")
+        check("disco do sistema mostra o uso de espaço",
+              system is not None and system._vitrine_bar.get_value() > 0 and "livres" in detail,
+              detail)
+        ctl._vitrine_toasts_before = ctl.toasts_shown
+        ctl.ext.hub.announce("selftest:usb", "Pen drive (teste)")
+        page.mark_new("system:/")
+
+    @step
+    def c3():
+        page = ctl.computer
+        system = page._cards.get("system:/")
+        check("aviso de dispositivo novo aparece com botão Abrir",
+              ctl.toasts_shown == ctl._vitrine_toasts_before + 1,
+              f"avisos={ctl.toasts_shown}")
+        check("dispositivo novo fica destacado e selecionado",
+              system is not None and system._vitrine_badge.get_visible()
+              and system in page.devices_box.get_selected_children())
+        page._unmark("system:/")
+        ctl.navigate(project)
+
+    @step
+    def c4():
+        st = state()
+        check("navegar sai do Meu computador",
+              ctl.content_stack.get_visible_child_name() == "tabs"
+              and ctl.sidebar_list.get_selected_row() is None
+              and st["uri"] == Gio.File.new_for_uri(project).get_uri(), str(st))
+        ctl.show_computer(True)
+
+    @step
+    def c5():
+        ctl.computer.open_child(ctl.computer._cards["system:/"])
+
+    @step
+    def c6():
+        st = state()
+        check("abrir o disco do sistema navega para /",
+              ctl.content_stack.get_visible_child_name() == "tabs" and st["uri"] == "file:///",
+              str(st))
+        ctl.navigate(home)
+
+    @step
     def s11():
         st = state()
         check("regra não vaza para outras pastas", st["view"] == "list", str(st))
@@ -2047,9 +2720,9 @@ def run(ctl) -> bool:
 
     GLib.timeout_add(STEP_MS, runner)
     return GLib.SOURCE_REMOVE
-__VITRINE_ARQUIVO_8__
+__VITRINE_ARQUIVO_9__
 mkdir -p "vitrine"
-cat > 'vitrine/util.py' <<'__VITRINE_ARQUIVO_9__'
+cat > 'vitrine/util.py' <<'__VITRINE_ARQUIVO_10__'
 """Utilitários: log, varredura da árvore de widgets e operações de arquivo nativas."""
 
 from __future__ import annotations
@@ -2285,9 +2958,9 @@ def format_time(dt: GLib.DateTime | None) -> str:
     if dt is None:
         return "—"
     return dt.to_local().format("%d/%m/%Y %H:%M")
-__VITRINE_ARQUIVO_9__
+__VITRINE_ARQUIVO_10__
 mkdir -p "vitrine"
-cat > 'vitrine/window.py' <<'__VITRINE_ARQUIVO_10__'
+cat > 'vitrine/window.py' <<'__VITRINE_ARQUIVO_11__'
 """Controlador por janela: injeta Colunas + Pré-visualização e aplica as regras por pasta."""
 
 from __future__ import annotations
@@ -2298,6 +2971,7 @@ from gi.repository import Adw, Gdk, Gio, GLib, Gtk
 
 from . import native
 from .columns import ColumnStrip
+from .computer import ComputerPage
 from .preview import PreviewPane
 from .util import ancestor, debug, dump_tree, find_by_type_name, find_first, gtype_name, guarded, log
 
@@ -2325,6 +2999,11 @@ class WindowController:
         self._reveal_source = 0
         self._media_cache: dict[str, bool] = {}
         self.model_watch = native.ModelWatch(self._on_native_selection)
+        self.computer: ComputerPage | None = None
+        self.content_stack: Gtk.Stack | None = None
+        self.sidebar_list: Gtk.ListBox | None = None
+        self._computer_visible = False
+        self.toasts_shown = 0
 
     # ───────────────────────── injeção ─────────────────────────
     def inject(self) -> bool:
@@ -2354,12 +3033,20 @@ class WindowController:
         )
         self.preview.set_visible(bool(self.cfg.get("preview_visible")))
 
-        # [colunas | abas do Nautilus]  ‖  [pré-visualização]
+        self.computer = ComputerPage(self, self.ext.hub)
+
+        # [colunas | (abas do Nautilus ou Meu computador)]  ‖  [pré-visualização]
         inner = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
         toolbar.set_content(None)  # `tv` continua vivo: a referência Python o segura
         tv.set_hexpand(True)
+        self.content_stack = Gtk.Stack(hexpand=True, hhomogeneous=False, vhomogeneous=False)
+        self.content_stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
+        self.content_stack.set_transition_duration(120)
+        self.content_stack.add_named(tv, "tabs")
+        self.content_stack.add_named(self.computer, "computer")
+        self.content_stack.set_visible_child_name("tabs")
         inner.append(self.strip)
-        inner.append(tv)
+        inner.append(self.content_stack)
 
         self.paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
         self.paned.set_wide_handle(False)
@@ -2374,6 +3061,7 @@ class WindowController:
         toolbar.set_content(self.paned)
 
         self._inject_buttons()
+        self._inject_sidebar_row()
         self._install_keys()
 
         tv.connect("notify::selected-page", self._on_tab_switched)
@@ -2395,7 +3083,113 @@ class WindowController:
         slot = self.active_slot()
         if slot is not None:
             self._on_slot_location(slot)
+        if self.cfg.get("start_on_computer"):
+            self.show_computer(True)
         return GLib.SOURCE_REMOVE
+
+    def _inject_sidebar_row(self) -> None:
+        """Entrada "Meu computador" no topo da barra lateral.
+
+        Usa a API pública AdwToolbarView.add_top_bar da própria barra lateral: nenhum
+        widget do Nautilus é movido; a lista nativa de locais continua intocada."""
+        sidebar = find_by_type_name(self.win, "NautilusSidebar")
+        tbv = ancestor(sidebar, lambda w: isinstance(w, Adw.ToolbarView)) if sidebar else None
+        if tbv is None or tbv.get_content() is not sidebar:
+            log("inject: barra lateral com estrutura inesperada; sem a entrada Meu computador")
+            return
+        lb = Gtk.ListBox()
+        lb.add_css_class("navigation-sidebar")
+        lb.add_css_class("vitrine-sidebar")
+        lb.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        row = Gtk.ListBoxRow()
+        row.set_tooltip_text("Meu computador (Ctrl+Shift+C)")
+        box = Gtk.Box(spacing=12)
+        box.append(Gtk.Image.new_from_icon_name("computer-symbolic"))
+        box.append(Gtk.Label(label="Meu computador", xalign=0, hexpand=True))
+        row.set_child(box)
+        lb.append(row)
+        lb.connect("row-activated", lambda *_a: self.show_computer(True))
+        tbv.add_top_bar(lb)
+        self.sidebar_list = lb
+
+        # Clicar em qualquer local nativo da barra lateral sai do Meu computador,
+        # mesmo que seja a pasta onde a aba já está (aí o Nautilus não navega).
+        click = Gtk.GestureClick.new()
+        click.set_button(Gdk.BUTTON_PRIMARY)
+        click.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        click.connect("released", lambda *_a: GLib.idle_add(self._leave_computer_if_visible))
+        sidebar.add_controller(click)
+
+    def _leave_computer_if_visible(self) -> bool:
+        if self._computer_visible:
+            self.show_computer(False)
+        return GLib.SOURCE_REMOVE
+
+    # ───────────────────────── Meu computador ─────────────────────────
+    def show_computer(self, on: bool = True) -> None:
+        if self.content_stack is None or self.computer is None:
+            return
+        self._computer_visible = on
+        self.content_stack.set_visible_child_name("computer" if on else "tabs")
+        if on:
+            if self.strip is not None:
+                self.strip.set_visible(False)
+            if self.preview is not None:
+                self.preview.set_folder(None)
+                self.preview.show_uris([])
+            if self.sidebar_list is not None:
+                self.sidebar_list.select_row(self.sidebar_list.get_row_at_index(0))
+            sidebar = find_by_type_name(self.win, "NautilusSidebar")
+            native_lb = find_first(sidebar, lambda w: isinstance(w, Gtk.ListBox)) if sidebar else None
+            if native_lb is not None:
+                native_lb.unselect_all()
+            self.computer.grab_focus()
+        else:
+            if self.sidebar_list is not None:
+                self.sidebar_list.unselect_all()
+            slot = self.active_slot()
+            if slot is not None:
+                self._set_columns_visible(getattr(slot, "_vitrine_mode", None) == "columns")
+                self._sync_active_ui(slot)
+
+    def computer_visible(self) -> bool:
+        return self._computer_visible
+
+    def leave_computer_and_open(self, uri: str) -> None:
+        self.show_computer(False)
+        self.navigate(uri)
+
+    def preview_location(self, uri: str | None) -> None:
+        if self.preview is not None and self.preview.get_visible() and uri:
+            self.preview.show_uris([uri])
+
+    def toast(self, text: str, button_label: str | None = None, on_button=None,
+              timeout: int = 5) -> None:
+        overlay = find_first(self.win, lambda w: isinstance(w, Adw.ToastOverlay))
+        if overlay is None:
+            log(f"aviso (sem área de avisos): {text}")
+            return
+        t = Adw.Toast(title=GLib.markup_escape_text(text))
+        t.set_timeout(timeout)
+        if button_label and on_button is not None:
+            t.set_button_label(button_label)
+            t.connect("button-clicked", lambda *_a: on_button())
+        overlay.add_toast(t)
+        self.toasts_shown += 1
+
+    def on_new_device(self, key: str, name: str, mount, volume) -> None:
+        """Pen drive, HD externo, cartão… acabou de ser conectado."""
+
+        def open_device():
+            m = mount or (volume.get_mount() if volume is not None else None)
+            if m is not None:
+                self.leave_computer_and_open(m.get_default_location().get_uri())
+            elif volume is not None:
+                self.computer.mount_and_open(volume, key)
+
+        self.toast(f"{name} conectado", "Abrir", open_device, timeout=10)
+        if self.computer is not None:
+            self.computer.mark_new(key)
 
     def _inject_buttons(self) -> None:
         box = Gtk.Box(spacing=0)
@@ -2433,6 +3227,8 @@ class WindowController:
     def _on_key(self, _ctrl, keyval, _code, state) -> bool:
         mods = state & _MOD_MASK
         if mods == Gdk.ModifierType.CONTROL_MASK:
+            if keyval in (Gdk.KEY_1, Gdk.KEY_2, Gdk.KEY_3) and self._computer_visible:
+                self.show_computer(False)
             if keyval == Gdk.KEY_3:
                 self.user_set_mode("columns")
                 return True
@@ -2441,10 +3237,13 @@ class WindowController:
                 mode = "list" if keyval == Gdk.KEY_1 else "grid"
                 GLib.idle_add(self._after_native_key, mode)
                 return False
-        if mods == (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK) and keyval in (
-                Gdk.KEY_P, Gdk.KEY_p):
-            self.set_preview_visible(not self.preview.get_visible())
-            return True
+        if mods == (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK):
+            if keyval in (Gdk.KEY_P, Gdk.KEY_p):
+                self.set_preview_visible(not self.preview.get_visible())
+                return True
+            if keyval in (Gdk.KEY_C, Gdk.KEY_c):
+                self.show_computer(not self._computer_visible)
+                return True
         return False
 
     def _after_native_key(self, mode: str) -> bool:
@@ -2469,6 +3268,9 @@ class WindowController:
         slot = self.active_slot()
         if slot is None:
             return
+        if self._computer_visible:
+            self.show_computer(False)
+            return
         self._set_columns_visible(getattr(slot, "_vitrine_mode", None) == "columns")
         self._sync_active_ui(slot)
 
@@ -2479,6 +3281,8 @@ class WindowController:
             return
         self.ext.suppress()
         if slot is self.active_slot():
+            if self._computer_visible:
+                self.show_computer(False)  # navegou (barra de caminho, voltar, busca…)
             self._sync_active_ui(slot)
         GLib.idle_add(self._apply_rule_for_slot, slot, uri, priority=GLib.PRIORITY_LOW)
 
@@ -2537,7 +3341,7 @@ class WindowController:
 
     # ───────────────────────── seleção / pré-visualização ─────────────────────────
     def _on_native_selection(self, _model) -> None:
-        if self.preview is None or not self.preview.get_visible():
+        if self.preview is None or not self.preview.get_visible() or self._computer_visible:
             return
         self.preview.show_uris(lambda: native.selected_uris(self.model_watch.get()),
                                prefetch=lambda: native.neighbor_uris(self.model_watch.get()))
@@ -2692,6 +3496,8 @@ class WindowController:
                 self.strip.set_location(loc if ok else None)
             else:
                 self.strip.set_visible(False)
+            if self._computer_visible:
+                self.strip.set_visible(False)
         self._sync_buttons()
 
     def set_preview_visible(self, on: bool) -> None:
@@ -2755,9 +3561,9 @@ class WindowController:
         if self.strip is not None:
             self.strip.teardown()
         self.ext.forget_window(self.win)
-__VITRINE_ARQUIVO_10__
+__VITRINE_ARQUIVO_11__
 mkdir -p "tools"
-cat > 'tools/smoke_test.py' <<'__VITRINE_ARQUIVO_11__'
+cat > 'tools/smoke_test.py' <<'__VITRINE_ARQUIVO_12__'
 """Teste rápido FORA do Nautilus: abre as colunas e o painel de preview numa janela
 própria e salva uma captura em PNG. Uso:
 
@@ -2839,9 +3645,9 @@ app = Adw.Application(application_id="io.github.vitrine.SmokeTest",
                       flags=Gio.ApplicationFlags.NON_UNIQUE)
 app.connect("activate", on_activate)
 app.run([])
-__VITRINE_ARQUIVO_11__
+__VITRINE_ARQUIVO_12__
 mkdir -p "tools"
-cat > 'tools/build_bootstrap.py' <<'__VITRINE_ARQUIVO_12__'
+cat > 'tools/build_bootstrap.py' <<'__VITRINE_ARQUIVO_13__'
 """Gera `criar-vitrine.sh`: um único script bash que recria o projeto inteiro
 (todos os arquivos) numa pasta e, se você quiser, já instala no Nautilus.
 
@@ -2956,8 +3762,8 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-__VITRINE_ARQUIVO_12__
-cat > 'install.sh' <<'__VITRINE_ARQUIVO_13__'
+__VITRINE_ARQUIVO_13__
+cat > 'install.sh' <<'__VITRINE_ARQUIVO_14__'
 #!/usr/bin/env bash
 # Instala a Vitrine para o seu usuário (não precisa de root, exceto para o nautilus-python).
 #
@@ -3015,8 +3821,8 @@ if [[ "$RESTART" == 1 ]]; then
   (setsid nautilus >/dev/null 2>&1 &)
 fi
 echo "Pronto. Log: ${XDG_CACHE_HOME:-$HOME/.cache}/nautilus-vitrine/vitrine.log"
-__VITRINE_ARQUIVO_13__
-cat > 'uninstall.sh' <<'__VITRINE_ARQUIVO_14__'
+__VITRINE_ARQUIVO_14__
+cat > 'uninstall.sh' <<'__VITRINE_ARQUIVO_15__'
 #!/usr/bin/env bash
 # Remove a Vitrine. Suas regras por pasta ficam em ~/.config/nautilus-vitrine
 # (use --purge para apagá-las também).
@@ -3028,15 +3834,15 @@ if [[ "${1:-}" == "--purge" ]]; then
 fi
 nautilus -q 2>/dev/null || true
 echo "Vitrine removida. Abra o Arquivos de novo para voltar ao Nautilus original."
-__VITRINE_ARQUIVO_14__
+__VITRINE_ARQUIVO_15__
 mkdir -p ".vscode"
-cat > '.vscode/extensions.json' <<'__VITRINE_ARQUIVO_15__'
+cat > '.vscode/extensions.json' <<'__VITRINE_ARQUIVO_16__'
 {
   "recommendations": ["ms-python.python", "ms-python.vscode-pylance"]
 }
-__VITRINE_ARQUIVO_15__
+__VITRINE_ARQUIVO_16__
 mkdir -p ".vscode"
-cat > '.vscode/settings.json' <<'__VITRINE_ARQUIVO_16__'
+cat > '.vscode/settings.json' <<'__VITRINE_ARQUIVO_17__'
 {
   "python.defaultInterpreterPath": "/usr/bin/python3",
   "python.analysis.extraPaths": ["${workspaceFolder}"],
@@ -3044,9 +3850,9 @@ cat > '.vscode/settings.json' <<'__VITRINE_ARQUIVO_16__'
   "editor.rulers": [100],
   "[python]": { "editor.tabSize": 4 }
 }
-__VITRINE_ARQUIVO_16__
+__VITRINE_ARQUIVO_17__
 mkdir -p ".vscode"
-cat > '.vscode/tasks.json' <<'__VITRINE_ARQUIVO_17__'
+cat > '.vscode/tasks.json' <<'__VITRINE_ARQUIVO_18__'
 {
   // Ctrl+Shift+P → "Tasks: Run Task" para ver estas tarefas.
   // Ctrl+Shift+B roda a tarefa padrão (instalar em modo dev + reiniciar o Nautilus).
@@ -3117,11 +3923,11 @@ cat > '.vscode/tasks.json' <<'__VITRINE_ARQUIVO_17__'
     }
   ]
 }
-__VITRINE_ARQUIVO_17__
-cat > 'README.md' <<'__VITRINE_ARQUIVO_18__'
+__VITRINE_ARQUIVO_18__
+cat > 'README.md' <<'__VITRINE_ARQUIVO_19__'
 # Vitrine para Nautilus
 
-**Modo Colunas, painel de pré-visualização e visualização por pasta para o Arquivos (Nautilus) do GNOME, inspirados no Finder do macOS, sem perder nenhuma função nativa.**
+**Modo Colunas, painel de pré-visualização, visualização por pasta e "Meu computador" para o Arquivos (Nautilus) do GNOME, inspirados no Finder do macOS, sem perder nenhuma função nativa.**
 
 ![Nautilus 51](https://img.shields.io/badge/Nautilus-51-4a86cf)
 ![Fedora 45](https://img.shields.io/badge/Fedora-45-51a2da)
@@ -3133,11 +3939,12 @@ cat > 'README.md' <<'__VITRINE_ARQUIVO_18__'
 ![Pasta Imagens em ícones grandes](docs/imagens.png)
 -->
 
-A Vitrine é uma extensão para o **Nautilus 51** (e, em princípio, o 50). Ela acrescenta ao gerenciador de arquivos do GNOME três recursos que fazem falta para quem vem do macOS:
+A Vitrine é uma extensão para o **Nautilus 51** (e, em princípio, o 50). Ela acrescenta ao gerenciador de arquivos do GNOME recursos que fazem falta para quem vem do macOS ou do Windows:
 
 - 🗂️ **Modo Colunas**: navegue pelas pastas em colunas, como no Finder.
 - 🖼️ **Painel de pré-visualização**: veja imagens, textos, vídeos, PDFs e pastas ao lado da lista, sem abrir nada.
 - 📌 **Visualização por pasta**: cada pasta lembra se você prefere lista, ícones, ícones grandes ou colunas.
+- 💻 **Meu computador**: suas pastas, discos e dispositivos numa página só, com o espaço livre de cada um e aviso quando um pen drive é conectado.
 
 A diferença em relação a outras soluções é o **modo híbrido**. A pasta atual continua sendo exibida pela **própria lista do Nautilus**, então menu de contexto, renomear, arrastar e soltar, recortar e colar, Desfazer, scripts e outras extensões funcionam exatamente como antes. A Vitrine só acrescenta coisas; não substitui nada.
 
@@ -3198,6 +4005,22 @@ Clique com o botão direito no **fundo de qualquer pasta** e escolha **Visualiza
 - Esquecer esta pasta (usar o padrão)
 - Usar a visualização atual como padrão
 - Mostrar/ocultar pré-visualização
+
+### 💻 Meu computador
+
+Abra pela entrada **Meu computador** no topo da barra lateral, com **Ctrl+Shift+C** ou pelo clique direito no fundo de uma pasta.
+
+- **Pastas**: Pasta pessoal, Área de trabalho, Documentos, Downloads, Músicas, Imagens e Vídeos.
+- **Dispositivos e unidades**: disco do sistema, outros discos, pen drives, HDs externos, cartões de memória e celulares, cada um com **barra de uso** (azul, laranja acima de 80%, vermelha acima de 92%) e "X livres de Y · sistema de arquivos". O uso é atualizado a cada 10 segundos enquanto a página está aberta.
+- **Rede**: compartilhamentos montados (SMB, SFTP, WebDAV…), quando houver.
+- **Dispositivos não montados** aparecem também. Ao abrir, a Vitrine monta o dispositivo e pede a senha se ele for criptografado.
+- **Remover com segurança**: botão ⏏ no card ou clique direito → *Remover com segurança* / *Desmontar*. Um aviso confirma quando já dá para tirar o dispositivo.
+- **Selecionar o card** mostra o conteúdo do disco no painel de pré-visualização. Abrir segue o clique simples ou duplo configurado no Nautilus.
+- Atalho para o app **Discos**, para formatar e particionar.
+
+**Dispositivo novo conectado?** Assim que um pen drive, HD externo ou cartão é inserido, aparece um aviso na janela do Nautilus (*"Pen drive conectado — Abrir"*). O card dele ganha o selo **Novo**, fica destacado e já vem **selecionado** na página Meu computador.
+
+A página fecha sozinha quando você navega para qualquer lugar: barra lateral, barra de caminho, Voltar ou busca.
 
 ---
 
@@ -3260,6 +4083,7 @@ O Nautilus volta exatamente ao original. Suas regras ficam guardadas; use `./uni
 | **Ctrl+3** | Modo Colunas |
 | **Ctrl+1** / **Ctrl+2** | Lista / Ícones (nativos do Nautilus, agora lembrados por pasta) |
 | **Ctrl+Shift+P** | Mostrar/ocultar a pré-visualização |
+| **Ctrl+Shift+C** | Abrir/fechar o Meu computador |
 | **Espaço** | Visualização rápida (Sushi) |
 | **Ctrl + roda do mouse** | Zoom (salvo por pasta na visualização em ícones) |
 | Clique do meio numa coluna | Abrir a pasta em nova janela |
@@ -3284,6 +4108,8 @@ Tudo funciona sem configurar nada. Para ajustes finos, edite os arquivos abaixo 
 | `auto_media_ratio` | `0.6` | Proporção mínima de mídia para considerar "pasta de fotos" |
 | `default_mode` | do Nautilus | Visualização das pastas sem regra: `list`, `grid` ou `columns` |
 | `default_grid_zoom` | do Nautilus | Zoom padrão dos ícones |
+| `start_on_computer` | `false` | Abrir o Nautilus já no Meu computador |
+| `notify_new_devices` | `true` | Avisar quando um pen drive, HD externo ou cartão for conectado |
 
 **`~/.config/nautilus-vitrine/folders.json`** guarda as regras por pasta:
 
@@ -3302,7 +4128,8 @@ Zooms válidos: `small`, `small-plus`, `medium`, `large`, `extra-large`.
 
 O Nautilus não tem API pública para novas visualizações ou painéis. Assim como o [My Computer for Nautilus](https://github.com/yannmasoch/nautilus-my-computer), a Vitrine roda dentro do processo do Nautilus (via nautilus-python) e insere seus widgets na janela em tempo de execução. Para quebrar o mínimo possível com atualizações do GNOME:
 
-- **Um único ponto de injeção.** Só o conteúdo do `AdwToolbarView` que contém as abas é envolvido por `[colunas | abas do Nautilus] ‖ [pré-visualização]`. O resto da janela fica intocado.
+- **Poucos pontos de injeção.** Só o conteúdo do `AdwToolbarView` que contém as abas é envolvido por `[colunas | abas do Nautilus ou Meu computador] ‖ [pré-visualização]`. A entrada "Meu computador" entra na barra lateral pela API pública `AdwToolbarView.add_top_bar`, sem mover nenhum widget do Nautilus. O resto da janela fica intocado.
+- **Dispositivos pelo GIO.** A página e os avisos usam o `Gio.VolumeMonitor` (o mesmo serviço que o Nautilus usa), e montar, desmontar e ejetar passam por `Gtk.MountOperation`, com o diálogo de senha do sistema.
 - **Nada do Nautilus é reimplementado.** A pasta atual é sempre a lista nativa, e a seleção é lida do próprio `NautilusViewModel`.
 - **Sem referências fortes.** Widgets e modelos do Nautilus nunca são mantidos vivos pela extensão; o modelo de seleção é acompanhado por *weak reference*.
 - **Operações nativas.** Mover, copiar e lixeira passam pela API D-Bus `org.gnome.Nautilus.FileOperations2`, com progresso, conflitos e Desfazer.
@@ -3318,6 +4145,7 @@ vitrine/
   columns.py            Modo Colunas (Gtk.DirectoryList + ListView)
   preview.py            painel de pré-visualização
   imageload.py          carregamento rápido de imagens, cache e pré-carregamento
+  computer.py           página Meu computador e monitor de dispositivos
   native.py             ponte com o Nautilus (slot, lista/grade, seleção)
   config.py             preferências e regras (JSON)
   util.py               log, varredura de widgets, operações D-Bus
@@ -3345,7 +4173,7 @@ O projeto inclui tarefas do **VS Code** (*Terminal → Run Task*):
 | Tarefa | O que faz |
 |---|---|
 | **Ctrl+Shift+B** | Instala em modo dev e reinicia o Nautilus |
-| Autoteste dentro do Nautilus | 19 verificações automáticas: injeção, colunas, preview, regras por pasta, zoom e tempo de carregamento das imagens. Suas regras e o zoom são restaurados no fim |
+| Autoteste dentro do Nautilus | 26 verificações automáticas: injeção, colunas, preview, regras por pasta, zoom, tempo de carregamento das imagens e Meu computador (página, uso de disco, aviso de dispositivo novo). Roda com regras temporárias; as suas e o zoom são restaurados no fim |
 | Rodar em modo depuração | `VITRINE_DEBUG=1 VITRINE_DUMP=1 nautilus` (inclui a árvore de widgets da janela no log) |
 | Acompanhar log | `tail -f ~/.cache/nautilus-vitrine/vitrine.log` |
 | Teste fora do Nautilus | Abre colunas e preview numa janela própria |
@@ -3416,8 +4244,8 @@ A técnica de injeção na janela foi inspirada no projeto **[My Computer for Na
 ## Licença
 
 [MIT](LICENSE)
-__VITRINE_ARQUIVO_18__
-cat > 'LICENSE' <<'__VITRINE_ARQUIVO_19__'
+__VITRINE_ARQUIVO_19__
+cat > 'LICENSE' <<'__VITRINE_ARQUIVO_20__'
 MIT License
 
 Copyright (c) 2026 Vitrine para Nautilus contributors
@@ -3443,15 +4271,15 @@ SOFTWARE.
 ---
 Inspired by "My Computer for Nautilus" (https://github.com/yannmasoch/nautilus-my-computer),
 Copyright (c) 2026 Yann Masoch, MIT License.
-__VITRINE_ARQUIVO_19__
-cat > '.gitignore' <<'__VITRINE_ARQUIVO_20__'
+__VITRINE_ARQUIVO_20__
+cat > '.gitignore' <<'__VITRINE_ARQUIVO_21__'
 __pycache__/
 *.pyc
 *.tmp
 dist/
 dist-build.log
-__VITRINE_ARQUIVO_20__
-cat > 'Makefile' <<'__VITRINE_ARQUIVO_21__'
+__VITRINE_ARQUIVO_21__
+cat > 'Makefile' <<'__VITRINE_ARQUIVO_22__'
 # Empacotamento local.  Requer: sudo dnf install make rpm-build python3-devel
 #
 #   make rpm        gera o RPM em dist/
@@ -3485,13 +4313,13 @@ install-rpm:
 
 clean:
 	rm -rf $(DIST)
-__VITRINE_ARQUIVO_21__
+__VITRINE_ARQUIVO_22__
 mkdir -p "packaging"
-cat > 'packaging/nautilus-vitrine.spec' <<'__VITRINE_ARQUIVO_22__'
+cat > 'packaging/nautilus-vitrine.spec' <<'__VITRINE_ARQUIVO_23__'
 %global extdir %{_datadir}/nautilus-python/extensions
 
 Name:           nautilus-vitrine
-Version:        0.1.0
+Version:        0.2.0
 Release:        1%{?dist}
 Summary:        Column view, preview pane and per-folder views for GNOME Files (Nautilus)
 
@@ -3540,11 +4368,15 @@ install -p -m 0644 vitrine/*.py %{buildroot}%{extdir}/vitrine/
 %{extdir}/vitrine/
 
 %changelog
+* Wed Nov 11 2026 Vinicius Bispo - 0.2.0-1
+- Página "Meu computador" com pastas, discos e uso de espaço
+- Aviso ao conectar pen drive, HD externo ou cartão, com botão Abrir
+
 * Wed Nov 11 2026 Vinicius Bispo - 0.1.0-1
 - Primeira versão: modo Colunas, painel de pré-visualização e visualização por pasta
-__VITRINE_ARQUIVO_22__
+__VITRINE_ARQUIVO_23__
 mkdir -p ".copr"
-cat > '.copr/Makefile' <<'__VITRINE_ARQUIVO_23__'
+cat > '.copr/Makefile' <<'__VITRINE_ARQUIVO_24__'
 # Usado pelo COPR (método "make srpm"): gera o SRPM direto do repositório git.
 # O COPR chama:  make -f .copr/Makefile srpm outdir=<pasta> spec=<arquivo .spec>
 SPEC := packaging/nautilus-vitrine.spec
@@ -3559,7 +4391,7 @@ srpm:
 	rpmbuild -bs $(SPEC) \
 		--define "_sourcedir $(outdir)" \
 		--define "_srcrpmdir $(outdir)"
-__VITRINE_ARQUIVO_23__
+__VITRINE_ARQUIVO_24__
 
 chmod +x install.sh uninstall.sh
 echo "Projeto criado em $TARGET"

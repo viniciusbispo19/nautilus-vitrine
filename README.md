@@ -1,6 +1,6 @@
 # Vitrine para Nautilus
 
-**Modo Colunas, painel de pré-visualização e visualização por pasta para o Arquivos (Nautilus) do GNOME, inspirados no Finder do macOS, sem perder nenhuma função nativa.**
+**Modo Colunas, painel de pré-visualização, visualização por pasta e "Meu computador" para o Arquivos (Nautilus) do GNOME, inspirados no Finder do macOS, sem perder nenhuma função nativa.**
 
 ![Nautilus 51](https://img.shields.io/badge/Nautilus-51-4a86cf)
 ![Fedora 45](https://img.shields.io/badge/Fedora-45-51a2da)
@@ -12,11 +12,12 @@
 ![Pasta Imagens em ícones grandes](docs/imagens.png)
 -->
 
-A Vitrine é uma extensão para o **Nautilus 51** (e, em princípio, o 50). Ela acrescenta ao gerenciador de arquivos do GNOME três recursos que fazem falta para quem vem do macOS:
+A Vitrine é uma extensão para o **Nautilus 51** (e, em princípio, o 50). Ela acrescenta ao gerenciador de arquivos do GNOME recursos que fazem falta para quem vem do macOS ou do Windows:
 
 - 🗂️ **Modo Colunas**: navegue pelas pastas em colunas, como no Finder.
 - 🖼️ **Painel de pré-visualização**: veja imagens, textos, vídeos, PDFs e pastas ao lado da lista, sem abrir nada.
 - 📌 **Visualização por pasta**: cada pasta lembra se você prefere lista, ícones, ícones grandes ou colunas.
+- 💻 **Meu computador**: suas pastas, discos e dispositivos numa página só, com o espaço livre de cada um e aviso quando um pen drive é conectado.
 
 A diferença em relação a outras soluções é o **modo híbrido**. A pasta atual continua sendo exibida pela **própria lista do Nautilus**, então menu de contexto, renomear, arrastar e soltar, recortar e colar, Desfazer, scripts e outras extensões funcionam exatamente como antes. A Vitrine só acrescenta coisas; não substitui nada.
 
@@ -77,6 +78,22 @@ Clique com o botão direito no **fundo de qualquer pasta** e escolha **Visualiza
 - Esquecer esta pasta (usar o padrão)
 - Usar a visualização atual como padrão
 - Mostrar/ocultar pré-visualização
+
+### 💻 Meu computador
+
+Abra pela entrada **Meu computador** no topo da barra lateral, com **Ctrl+Shift+C** ou pelo clique direito no fundo de uma pasta.
+
+- **Pastas**: Pasta pessoal, Área de trabalho, Documentos, Downloads, Músicas, Imagens e Vídeos.
+- **Dispositivos e unidades**: disco do sistema, outros discos, pen drives, HDs externos, cartões de memória e celulares, cada um com **barra de uso** (azul, laranja acima de 80%, vermelha acima de 92%) e "X livres de Y · sistema de arquivos". O uso é atualizado a cada 10 segundos enquanto a página está aberta.
+- **Rede**: compartilhamentos montados (SMB, SFTP, WebDAV…), quando houver.
+- **Dispositivos não montados** aparecem também. Ao abrir, a Vitrine monta o dispositivo e pede a senha se ele for criptografado.
+- **Remover com segurança**: botão ⏏ no card ou clique direito → *Remover com segurança* / *Desmontar*. Um aviso confirma quando já dá para tirar o dispositivo.
+- **Selecionar o card** mostra o conteúdo do disco no painel de pré-visualização. Abrir segue o clique simples ou duplo configurado no Nautilus.
+- Atalho para o app **Discos**, para formatar e particionar.
+
+**Dispositivo novo conectado?** Assim que um pen drive, HD externo ou cartão é inserido, aparece um aviso na janela do Nautilus (*"Pen drive conectado — Abrir"*). O card dele ganha o selo **Novo**, fica destacado e já vem **selecionado** na página Meu computador.
+
+A página fecha sozinha quando você navega para qualquer lugar: barra lateral, barra de caminho, Voltar ou busca.
 
 ---
 
@@ -139,6 +156,7 @@ O Nautilus volta exatamente ao original. Suas regras ficam guardadas; use `./uni
 | **Ctrl+3** | Modo Colunas |
 | **Ctrl+1** / **Ctrl+2** | Lista / Ícones (nativos do Nautilus, agora lembrados por pasta) |
 | **Ctrl+Shift+P** | Mostrar/ocultar a pré-visualização |
+| **Ctrl+Shift+C** | Abrir/fechar o Meu computador |
 | **Espaço** | Visualização rápida (Sushi) |
 | **Ctrl + roda do mouse** | Zoom (salvo por pasta na visualização em ícones) |
 | Clique do meio numa coluna | Abrir a pasta em nova janela |
@@ -163,6 +181,8 @@ Tudo funciona sem configurar nada. Para ajustes finos, edite os arquivos abaixo 
 | `auto_media_ratio` | `0.6` | Proporção mínima de mídia para considerar "pasta de fotos" |
 | `default_mode` | do Nautilus | Visualização das pastas sem regra: `list`, `grid` ou `columns` |
 | `default_grid_zoom` | do Nautilus | Zoom padrão dos ícones |
+| `start_on_computer` | `false` | Abrir o Nautilus já no Meu computador |
+| `notify_new_devices` | `true` | Avisar quando um pen drive, HD externo ou cartão for conectado |
 
 **`~/.config/nautilus-vitrine/folders.json`** guarda as regras por pasta:
 
@@ -181,7 +201,8 @@ Zooms válidos: `small`, `small-plus`, `medium`, `large`, `extra-large`.
 
 O Nautilus não tem API pública para novas visualizações ou painéis. Assim como o [My Computer for Nautilus](https://github.com/yannmasoch/nautilus-my-computer), a Vitrine roda dentro do processo do Nautilus (via nautilus-python) e insere seus widgets na janela em tempo de execução. Para quebrar o mínimo possível com atualizações do GNOME:
 
-- **Um único ponto de injeção.** Só o conteúdo do `AdwToolbarView` que contém as abas é envolvido por `[colunas | abas do Nautilus] ‖ [pré-visualização]`. O resto da janela fica intocado.
+- **Poucos pontos de injeção.** Só o conteúdo do `AdwToolbarView` que contém as abas é envolvido por `[colunas | abas do Nautilus ou Meu computador] ‖ [pré-visualização]`. A entrada "Meu computador" entra na barra lateral pela API pública `AdwToolbarView.add_top_bar`, sem mover nenhum widget do Nautilus. O resto da janela fica intocado.
+- **Dispositivos pelo GIO.** A página e os avisos usam o `Gio.VolumeMonitor` (o mesmo serviço que o Nautilus usa), e montar, desmontar e ejetar passam por `Gtk.MountOperation`, com o diálogo de senha do sistema.
 - **Nada do Nautilus é reimplementado.** A pasta atual é sempre a lista nativa, e a seleção é lida do próprio `NautilusViewModel`.
 - **Sem referências fortes.** Widgets e modelos do Nautilus nunca são mantidos vivos pela extensão; o modelo de seleção é acompanhado por *weak reference*.
 - **Operações nativas.** Mover, copiar e lixeira passam pela API D-Bus `org.gnome.Nautilus.FileOperations2`, com progresso, conflitos e Desfazer.
@@ -197,6 +218,7 @@ vitrine/
   columns.py            Modo Colunas (Gtk.DirectoryList + ListView)
   preview.py            painel de pré-visualização
   imageload.py          carregamento rápido de imagens, cache e pré-carregamento
+  computer.py           página Meu computador e monitor de dispositivos
   native.py             ponte com o Nautilus (slot, lista/grade, seleção)
   config.py             preferências e regras (JSON)
   util.py               log, varredura de widgets, operações D-Bus
@@ -224,7 +246,7 @@ O projeto inclui tarefas do **VS Code** (*Terminal → Run Task*):
 | Tarefa | O que faz |
 |---|---|
 | **Ctrl+Shift+B** | Instala em modo dev e reinicia o Nautilus |
-| Autoteste dentro do Nautilus | 19 verificações automáticas: injeção, colunas, preview, regras por pasta, zoom e tempo de carregamento das imagens. Suas regras e o zoom são restaurados no fim |
+| Autoteste dentro do Nautilus | 26 verificações automáticas: injeção, colunas, preview, regras por pasta, zoom, tempo de carregamento das imagens e Meu computador (página, uso de disco, aviso de dispositivo novo). Roda com regras temporárias; as suas e o zoom são restaurados no fim |
 | Rodar em modo depuração | `VITRINE_DEBUG=1 VITRINE_DUMP=1 nautilus` (inclui a árvore de widgets da janela no log) |
 | Acompanhar log | `tail -f ~/.cache/nautilus-vitrine/vitrine.log` |
 | Teste fora do Nautilus | Abre colunas e preview numa janela própria |

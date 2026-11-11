@@ -67,6 +67,19 @@ def run(ctl) -> bool:
     saved_folders = copy.deepcopy(cfg.folders)
     saved_settings = copy.deepcopy(cfg.settings)
     saved_zoom = ctl.ext.current_grid_zoom()
+    # Roda com regras padrão (as suas ficam num backup e voltam no fim).
+    try:
+        import json
+
+        from .config import FOLDERS_PATH
+        with open(FOLDERS_PATH + ".selftest-backup", "w", encoding="utf-8") as fh:
+            json.dump(saved_folders, fh, indent=2, ensure_ascii=False)
+    except OSError:
+        pass
+    cfg.folders.clear()
+    cfg._seed_pictures_rule()
+    cfg.settings["default_mode"] = "list"
+    cfg.settings["start_on_computer"] = False
     home = Gio.File.new_for_path(os.path.expanduser("~")).get_uri()
     pictures = GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_PICTURES)
     pictures_uri = Gio.File.new_for_path(pictures).get_uri() if pictures else None
@@ -204,6 +217,67 @@ def run(ctl) -> bool:
         check("preview mostra a mesma seleção do Nautilus depois de trocar para ícones",
               expected is None or st["preview"][2] == expected,
               f"preview={st['preview']} nativo={sel}")
+        ctl.navigate(home)
+
+    @step
+    def c1():
+        ctl.show_computer(True)
+
+    @step
+    def c2():
+        page = ctl.computer
+        tiles = 0
+        child = page.folders_box.get_first_child()
+        while child is not None:
+            tiles += 1
+            child = child.get_next_sibling()
+        system = page._cards.get("system:/")
+        detail = system._vitrine_detail.get_text() if system is not None else ""
+        check("Meu computador abre (Ctrl+Shift+C / barra lateral)",
+              ctl.content_stack.get_visible_child_name() == "computer"
+              and ctl.sidebar_list is not None
+              and ctl.sidebar_list.get_selected_row() is not None,
+              f"página={ctl.content_stack.get_visible_child_name()} sidebar={ctl.sidebar_list is not None}")
+        check("pastas pessoais aparecem", tiles >= 5, f"{tiles} pastas")
+        check("disco do sistema mostra o uso de espaço",
+              system is not None and system._vitrine_bar.get_value() > 0 and "livres" in detail,
+              detail)
+        ctl._vitrine_toasts_before = ctl.toasts_shown
+        ctl.ext.hub.announce("selftest:usb", "Pen drive (teste)")
+        page.mark_new("system:/")
+
+    @step
+    def c3():
+        page = ctl.computer
+        system = page._cards.get("system:/")
+        check("aviso de dispositivo novo aparece com botão Abrir",
+              ctl.toasts_shown == ctl._vitrine_toasts_before + 1,
+              f"avisos={ctl.toasts_shown}")
+        check("dispositivo novo fica destacado e selecionado",
+              system is not None and system._vitrine_badge.get_visible()
+              and system in page.devices_box.get_selected_children())
+        page._unmark("system:/")
+        ctl.navigate(project)
+
+    @step
+    def c4():
+        st = state()
+        check("navegar sai do Meu computador",
+              ctl.content_stack.get_visible_child_name() == "tabs"
+              and ctl.sidebar_list.get_selected_row() is None
+              and st["uri"] == Gio.File.new_for_uri(project).get_uri(), str(st))
+        ctl.show_computer(True)
+
+    @step
+    def c5():
+        ctl.computer.open_child(ctl.computer._cards["system:/"])
+
+    @step
+    def c6():
+        st = state()
+        check("abrir o disco do sistema navega para /",
+              ctl.content_stack.get_visible_child_name() == "tabs" and st["uri"] == "file:///",
+              str(st))
         ctl.navigate(home)
 
     @step
