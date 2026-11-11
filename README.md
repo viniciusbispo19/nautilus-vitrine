@@ -87,19 +87,7 @@ Clique com o botão direito no **fundo de qualquer pasta** e escolha **Visualiza
 - **Nautilus 51** (GNOME 51, Fedora 45), versão em que a extensão foi testada. O Nautilus 50 (Fedora 44) tem a mesma estrutura de janela e deve funcionar, mas ainda não foi testado. Outras distribuições com essas versões também devem funcionar.
 - `nautilus-python` (o instalador oferece instalar).
 
-### Opção 1 (recomendada): pacote RPM pelo COPR
-
-```bash
-sudo dnf copr enable viniciusbispo19/nautilus-vitrine
-```
-
-```bash
-sudo dnf install nautilus-vitrine && nautilus -q
-```
-
-O `dnf` instala junto o `nautilus-python` e as demais dependências, e a Vitrine passa a receber atualizações junto com o resto do sistema (`sudo dnf upgrade`). Para remover: `sudo dnf remove nautilus-vitrine`.
-
-### Opção 2: clonar o repositório
+### Opção 1 (recomendada): clonar o repositório
 
 ```bash
 git clone https://github.com/viniciusbispo19/nautilus-vitrine.git
@@ -109,9 +97,9 @@ git clone https://github.com/viniciusbispo19/nautilus-vitrine.git
 cd nautilus-vitrine && ./install.sh
 ```
 
-O `install.sh` instala o `nautilus-python` se faltar (pede sua senha), copia a extensão para `~/.local/share/nautilus-python/extensions/` e reinicia o Nautilus.
+O `install.sh` instala o `nautilus-python` se faltar (pede sua senha), copia a extensão para `~/.local/share/nautilus-python/extensions/` e reinicia o Nautilus. Para atualizar depois: `git pull && ./install.sh`.
 
-### Opção 3: script único
+### Opção 2: script único
 
 O arquivo `criar-vitrine.sh` contém o projeto inteiro. Baixe-o e rode:
 
@@ -121,9 +109,18 @@ bash criar-vitrine.sh --instalar
 
 Ele cria a pasta `~/nautilus-vitrine` com todos os arquivos e já instala. Sem `--instalar`, só cria a pasta. Também dá para passar outro destino: `bash criar-vitrine.sh ~/Projetos/vitrine`.
 
-### Desinstalar
+### Em breve: pacote RPM pelo COPR
 
-Pelo pacote: `sudo dnf remove nautilus-vitrine`. Pelos scripts (opções 2 e 3):
+O pacote RPM já está pronto (`packaging/nautilus-vitrine.spec`), mas **ainda não foi publicado no COPR**. Quando estiver disponível, a instalação será:
+
+```
+sudo dnf copr enable viniciusbispo19/nautilus-vitrine
+sudo dnf install nautilus-vitrine
+```
+
+Até lá, use a opção 1 ou 2, ou gere o RPM localmente (veja *Empacotamento*).
+
+### Desinstalar
 
 ```bash
 ./uninstall.sh
@@ -131,7 +128,7 @@ Pelo pacote: `sudo dnf remove nautilus-vitrine`. Pelos scripts (opções 2 e 3):
 
 O Nautilus volta exatamente ao original. Suas regras ficam guardadas; use `./uninstall.sh --purge` para apagar tudo.
 
-> **Não é uma extensão do GNOME Shell.** A Vitrine roda dentro do Nautilus, via nautilus-python, e por isso não aparece no app Extensões nem no extensions.gnome.org. Ela é gerenciada pelo `dnf` ou pelos scripts acima.
+> **Não é uma extensão do GNOME Shell.** A Vitrine roda dentro do Nautilus, via nautilus-python, e por isso não aparece no app Extensões nem no extensions.gnome.org. Ela é gerenciada pelos scripts acima.
 
 ---
 
@@ -248,7 +245,7 @@ grep SELFTEST ~/.cache/nautilus-vitrine/vitrine.log
 ### Empacotamento (RPM / COPR)
 
 ```bash
-sudo dnf install rpm-build python3-devel
+sudo dnf install make rpm-build python3-devel
 ```
 
 ```bash
@@ -282,7 +279,8 @@ Para lançar uma versão nova: aumente `Version` e acrescente uma entrada no `%c
 
 ## Próximos passos
 
-- [x] Pacote RPM e build automático no COPR (`dnf install`)
+- [x] Pacote RPM (`make rpm`)
+- [ ] Publicação no COPR (`dnf copr enable`)
 - [ ] Tocar vídeo e áudio direto no painel
 - [ ] Folhear páginas de PDF no painel
 - [ ] Dados EXIF da foto (câmera, lente, GPS)

@@ -1,4 +1,4 @@
-# Empacotamento local.  Requer: sudo dnf install rpm-build python3-devel
+# Empacotamento local.  Requer: sudo dnf install make rpm-build python3-devel
 #
 #   make rpm        gera o RPM em dist/
 #   make srpm       gera só o SRPM (o mesmo que o COPR usa)
