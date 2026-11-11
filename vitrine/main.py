@@ -137,6 +137,10 @@ class VitrineExtension(GObject.GObject, Nautilus.MenuProvider):
             ctl = next(iter(self.windows.values()))
         return ctl
 
+    def refresh_computer_pages(self) -> None:
+        for ctl in list(self.windows.values()):
+            ctl.apply_computer_settings()
+
     def _on_new_device(self, key, name, mount, volume) -> None:
         """Avisa só na janela ativa (evita um aviso repetido por janela aberta)."""
         if not self.cfg.get("notify_new_devices"):

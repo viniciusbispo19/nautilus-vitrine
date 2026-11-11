@@ -223,14 +223,25 @@ def run(ctl) -> bool:
     def c1():
         ctl.show_computer(True)
 
+    def tile_uris(page):
+        uris = []
+        for box in (page.places_box, page.bookmarks_box):
+            child = box.get_first_child()
+            while child is not None:
+                uris.append(getattr(child, "_vitrine_uri", None))
+                child = child.get_next_sibling()
+        return uris
+
     @step
     def c2():
         page = ctl.computer
-        tiles = 0
-        child = page.folders_box.get_first_child()
-        while child is not None:
-            tiles += 1
-            child = child.get_next_sibling()
+        uris = tile_uris(page)
+        tiles = len(uris)
+        sidebar = [e["uri"] for e in native.sidebar_places(ctl.win) if not e["device"]]
+        check("todos os locais da barra lateral aparecem (Recentes, Favoritos, Rede, Lixeira, marcadores)",
+              sidebar and all(u in uris for u in sidebar)
+              and all(s in uris for s in ("recent:///", "starred:///", "trash:///")),
+              f"barra lateral={len(sidebar)} página={tiles} faltando={[u for u in sidebar if u not in uris]}")
         system = page._cards.get("system:/")
         detail = system._vitrine_detail.get_text() if system is not None else ""
         check("Meu computador abre (Ctrl+Shift+C / barra lateral)",
@@ -238,7 +249,6 @@ def run(ctl) -> bool:
               and ctl.sidebar_list is not None
               and ctl.sidebar_list.get_selected_row() is not None,
               f"página={ctl.content_stack.get_visible_child_name()} sidebar={ctl.sidebar_list is not None}")
-        check("pastas pessoais aparecem", tiles >= 5, f"{tiles} pastas")
         check("disco do sistema mostra o uso de espaço",
               system is not None and system._vitrine_bar.get_value() > 0 and "livres" in detail,
               detail)
@@ -277,6 +287,55 @@ def run(ctl) -> bool:
         st = state()
         check("abrir o disco do sistema navega para /",
               ctl.content_stack.get_visible_child_name() == "tabs" and st["uri"] == "file:///",
+              str(st))
+        ctl.navigate(home)
+
+    @step
+    def c7():
+        ctl.show_computer(True)
+        page = ctl.computer
+        page.set_item_hidden("starred:///", True)
+        page.set_section_enabled("bookmarks", False)
+
+    @step
+    def c8():
+        page = ctl.computer
+        uris = tile_uris(page)
+        check("personalizar: ocultar item e seção",
+              "starred:///" not in uris and not page.sections["bookmarks"].get_visible()
+              and page.sections["places"].get_visible(),
+              f"itens={uris}")
+        page.set_item_hidden("starred:///", False)
+        page.set_section_enabled("bookmarks", True)
+        check("personalizar: mostrar de novo",
+              "starred:///" in tile_uris(page) and page.sections["bookmarks"].get_visible())
+        try:
+            page.open_settings()
+            dlg = page._settings_dialog
+            ok = dlg is not None and dlg.get_root() is not None
+            dlg.close()
+        except Exception as err:  # noqa: BLE001
+            ok = False
+            log(f"open_settings: {err!r}")
+        check("tela de personalização abre", ok)
+        cfg.settings["start_on_computer"] = True
+        project_dir = Gio.File.new_for_uri(project).get_uri()
+        check("opção abrir no Meu computador (só ao abrir na pasta pessoal)",
+              ctl.should_start_on_computer(home) and not ctl.should_start_on_computer(project_dir))
+        cfg.settings["start_on_computer"] = False
+        for box in (page.places_box,):
+            child = box.get_first_child()
+            while child is not None:
+                if getattr(child, "_vitrine_uri", None) == "recent:///":
+                    page.open_child(child)
+                    break
+                child = child.get_next_sibling()
+
+    @step
+    def c9():
+        st = state()
+        check("abrir Recentes pelo Meu computador",
+              ctl.content_stack.get_visible_child_name() == "tabs" and st["uri"] == "recent:///",
               str(st))
         ctl.navigate(home)
 

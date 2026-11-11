@@ -53,6 +53,8 @@ install -p -m 0644 vitrine/*.py %{buildroot}%{extdir}/vitrine/
 * Wed Nov 11 2026 Vinicius Bispo - 0.2.0-1
 - Página "Meu computador" com pastas, discos e uso de espaço
 - Aviso ao conectar pen drive, HD externo ou cartão, com botão Abrir
+- Todos os locais da barra lateral (Recentes, Favoritos, Rede, Lixeira, marcadores)
+- Personalização (seções, itens, entrada na barra lateral) e opção de abrir direto nele
 
 * Wed Nov 11 2026 Vinicius Bispo - 0.1.0-1
 - Primeira versão: modo Colunas, painel de pré-visualização e visualização por pasta

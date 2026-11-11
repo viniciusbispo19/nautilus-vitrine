@@ -120,9 +120,27 @@ class WindowController:
         slot = self.active_slot()
         if slot is not None:
             self._on_slot_location(slot)
-        if self.cfg.get("start_on_computer"):
+        if self.should_start_on_computer(native.slot_uri(slot)):
             self.show_computer(True)
+            log("janela aberta direto no Meu computador")
         return GLib.SOURCE_REMOVE
+
+    def should_start_on_computer(self, uri: str | None) -> bool:
+        """Só quando a janela abriu na pasta pessoal (menu de aplicativos, Ctrl+N).
+        Se outro programa pediu uma pasta específica, ela é respeitada."""
+        if not self.cfg.get("start_on_computer") or not uri:
+            return False
+        home = Gio.File.new_for_path(os.path.expanduser("~"))
+        return Gio.File.new_for_uri(uri).equal(home)
+
+    def apply_computer_settings(self) -> None:
+        if self.sidebar_list is not None:
+            self.sidebar_list.set_visible(bool(self.cfg.get("computer_in_sidebar")))
+        if self.computer is not None:
+            if self.computer.get_mapped():
+                self.computer.refresh()
+            else:
+                self.computer._dirty = True
 
     def _inject_sidebar_row(self) -> None:
         """Entrada "Meu computador" no topo da barra lateral.
@@ -148,6 +166,7 @@ class WindowController:
         lb.connect("row-activated", lambda *_a: self.show_computer(True))
         tbv.add_top_bar(lb)
         self.sidebar_list = lb
+        lb.set_visible(bool(self.cfg.get("computer_in_sidebar")))
 
         # Clicar em qualquer local nativo da barra lateral sai do Meu computador,
         # mesmo que seja a pasta onde a aba já está (aí o Nautilus não navega).
@@ -197,8 +216,10 @@ class WindowController:
         self.navigate(uri)
 
     def preview_location(self, uri: str | None) -> None:
-        if self.preview is not None and self.preview.get_visible() and uri:
-            self.preview.show_uris([uri])
+        if self.preview is None or not self.preview.get_visible():
+            return
+        # Recentes, Favoritos, Rede e Lixeira não são pastas comuns: sem preview.
+        self.preview.show_uris([uri] if uri and native.is_regular_location(uri) else [])
 
     def toast(self, text: str, button_label: str | None = None, on_button=None,
               timeout: int = 5) -> None:

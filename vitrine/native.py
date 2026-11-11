@@ -58,6 +58,46 @@ def open_location(slot, uri: str) -> bool:
     return bool(slot.activate_action("slot.open-location", GLib.Variant("s", uri)))
 
 
+# ── barra lateral nativa ──
+
+def _prop(obj, name):
+    try:
+        return obj.get_property(name)
+    except (TypeError, AttributeError):
+        return None
+
+
+def sidebar_places(win) -> list[dict]:
+    """Os locais da barra lateral do Nautilus, na mesma ordem e com os mesmos nomes.
+
+    Lê as propriedades de cada NautilusSidebarRow (uri, label, start-icon…).
+    Linhas de dispositivos (com mount/volume/drive) vêm marcadas em `device`."""
+    sidebar = find_first(win, lambda w: gtype_name(w) == "NautilusSidebar")
+    if sidebar is None:
+        return []
+    out = []
+    for row in walk(sidebar):
+        if gtype_name(row) != "NautilusSidebarRow":
+            continue
+        uri = _prop(row, "uri")
+        label = _prop(row, "label")
+        if not uri or not label or _prop(row, "placeholder"):
+            continue
+        if row.has_css_class("sidebar-new-bookmark-row"):
+            continue
+        device = any(_prop(row, p) is not None for p in ("mount", "volume", "drive"))
+        out.append({
+            "uri": uri,
+            "label": label,
+            "gicon": _prop(row, "start-icon"),
+            "section": int(_prop(row, "section-type") or 0),
+            "place": int(_prop(row, "place-type") or 0),
+            "device": device,
+            "visible": row.get_visible(),
+        })
+    return out
+
+
 # ── modo de visualização (lista/grade) ──
 
 def _files_view(slot):

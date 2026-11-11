@@ -515,22 +515,71 @@ import time
 
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk, Pango
 
-from . import util
+from . import native, util
 from .util import guarded, log
 
 FS_ATTRS = "filesystem::size,filesystem::free,filesystem::type,filesystem::readonly"
 USAGE_REFRESH_S = 10
 ANNOUNCE_DEDUP_S = 15
 
-FOLDERS = (
-    (None, "user-home", "Pasta pessoal"),
-    (GLib.UserDirectory.DIRECTORY_DESKTOP, "user-desktop", None),
-    (GLib.UserDirectory.DIRECTORY_DOCUMENTS, "folder-documents", None),
-    (GLib.UserDirectory.DIRECTORY_DOWNLOAD, "folder-download", None),
-    (GLib.UserDirectory.DIRECTORY_MUSIC, "folder-music", None),
-    (GLib.UserDirectory.DIRECTORY_PICTURES, "folder-pictures", None),
-    (GLib.UserDirectory.DIRECTORY_VIDEOS, "folder-videos", None),
+# Seções da página (chave em settings.json → "computer_sections").
+SECTIONS = (
+    ("places", "Locais", "Pasta pessoal, Recentes, Favoritos, Rede, Lixeira"),
+    ("bookmarks", "Marcadores", "As pastas fixadas na barra lateral"),
+    ("devices", "Dispositivos e unidades", "Discos, pen drives, HDs externos, cartões"),
+    ("network", "Rede", "Compartilhamentos montados"),
+    ("disks_button", "Atalho para o app Discos", "Formatar e particionar"),
 )
+
+# Usado só se a barra lateral do Nautilus não puder ser lida.
+_FALLBACK_PLACES = (
+    ("file://HOME", "Pasta pessoal", "user-home-symbolic", 1),
+    ("recent:///", "Recentes", "document-open-recent-symbolic", 1),
+    ("starred:///", "Favoritos", "starred-symbolic", 1),
+    ("x-network-view:///", "Rede", "network-computer-symbolic", 1),
+    ("trash:///", "Lixeira", "user-trash-symbolic", 1),
+)
+_COLOR_ICON_FIX = {"user-trash-full": "user-trash-full", "user-trash": "user-trash"}
+
+
+def _color_icon(gicon, uri: str) -> Gio.Icon:
+    """Versão colorida (não simbólica) de um ícone da barra lateral, para os blocos de 48 px."""
+    names = list(gicon.get_names()) if isinstance(gicon, Gio.ThemedIcon) else []
+    regular = [n for n in names if not n.endswith("-symbolic")]
+    regular += [n[: -len("-symbolic")] for n in names if n.endswith("-symbolic")]
+    if (GLib.Uri.peek_scheme(uri) or "") == "file":
+        regular.append("folder")
+    if not regular:
+        return gicon if gicon is not None else Gio.ThemedIcon.new("folder")
+    return Gio.ThemedIcon.new_from_names(regular + names)
+
+
+def _bookmarks_file() -> list[tuple[str, str]]:
+    path = os.path.join(GLib.get_user_config_dir(), "gtk-3.0", "bookmarks")
+    out = []
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                uri, _sp, label = line.partition(" ")
+                out.append((uri, label or GLib.filename_display_basename(
+                    Gio.File.new_for_uri(uri).get_path() or uri)))
+    except OSError:
+        pass
+    return out
+
+
+def fallback_places() -> list[dict]:
+    home = Gio.File.new_for_path(os.path.expanduser("~")).get_uri()
+    out = [{"uri": u.replace("file://HOME", home), "label": label,
+            "gicon": Gio.ThemedIcon.new(icon), "section": sec, "device": False}
+           for u, label, icon, sec in _FALLBACK_PLACES]
+    for uri, label in _bookmarks_file():
+        out.append({"uri": uri, "label": label, "gicon": Gio.ThemedIcon.new("folder-symbolic"),
+                    "section": 2, "device": False})
+    return out
 
 
 def _os_name() -> str:
@@ -708,24 +757,42 @@ class ComputerPage(Gtk.ScrolledWindow):
         title.add_css_class("title-1")
         subtitle = Gtk.Label(label=f"{socket.gethostname()} · {_os_name()}", xalign=0)
         subtitle.add_css_class("dim-label")
-        head = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-        head.append(title)
-        head.append(subtitle)
+        head_text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, hexpand=True)
+        head_text.append(title)
+        head_text.append(subtitle)
+        customize = Gtk.Button(icon_name="document-edit-symbolic", valign=Gtk.Align.CENTER,
+                               tooltip_text="Personalizar o Meu computador")
+        customize.add_css_class("flat")
+        customize.add_css_class("circular")
+        customize.connect("clicked", lambda *_: self.open_settings())
+        head = Gtk.Box(spacing=12)
+        head.append(head_text)
+        head.append(customize)
         body.append(head)
 
-        self.folders_box = self._flowbox(max_per_line=8)
-        body.append(self._section("Pastas", self.folders_box))
+        self.places_box = self._flowbox(max_per_line=8)
+        self.bookmarks_box = self._flowbox(max_per_line=8)
         self.devices_box = self._flowbox(max_per_line=4)
-        body.append(self._section("Dispositivos e unidades", self.devices_box))
         self.network_box = self._flowbox(max_per_line=4)
-        self.network_section = self._section("Rede", self.network_box)
-        body.append(self.network_section)
+        self.sections: dict[str, Gtk.Widget] = {
+            "places": self._section("Locais", self.places_box),
+            "bookmarks": self._section("Marcadores", self.bookmarks_box),
+            "devices": self._section("Dispositivos e unidades", self.devices_box),
+            "network": self._section("Rede", self.network_box),
+        }
+        for widget in self.sections.values():
+            body.append(widget)
 
-        if GLib.find_program_in_path("gnome-disks"):
-            disks = Gtk.Button(label="Abrir Discos (formatar, partições…)", halign=Gtk.Align.START)
-            disks.add_css_class("flat")
-            disks.connect("clicked", lambda *_: self._launch("gnome-disks"))
-            body.append(disks)
+        self.disks_button = Gtk.Button(label="Abrir Discos (formatar, partições…)",
+                                       halign=Gtk.Align.START)
+        self.disks_button.add_css_class("flat")
+        self.disks_button.connect("clicked", lambda *_: self._launch("gnome-disks"))
+        self._has_disks_app = GLib.find_program_in_path("gnome-disks") is not None
+        body.append(self.disks_button)
+        self.empty_label = Gtk.Label(
+            label="Tudo oculto. Use o botão ✎ acima para escolher o que aparece aqui.")
+        self.empty_label.add_css_class("dim-label")
+        body.append(self.empty_label)
 
         hub.on_changed(self._on_hub_changed)
         self.connect("map", lambda *_: self._on_map())
@@ -755,13 +822,37 @@ class ComputerPage(Gtk.ScrolledWindow):
 
     def _on_map(self) -> None:
         single = self._nautilus_prefs.get_string("click-policy") == "single"
-        for fb in (self.folders_box, self.devices_box, self.network_box):
+        for fb in self._boxes():
             fb.set_activate_on_single_click(single)
-        if self._dirty:
-            self.refresh()
-        else:
-            self._refresh_usage()
+        # A barra lateral pode ter mudado (marcador novo, removido…): sempre remonta.
+        self.refresh()
         self._start_usage_poll()
+
+    def _boxes(self):
+        return (self.places_box, self.bookmarks_box, self.devices_box, self.network_box)
+
+    # ── preferências ──
+    def _cfg(self):
+        return self.ctl.cfg
+
+    def section_enabled(self, key: str) -> bool:
+        return bool((self._cfg().get("computer_sections") or {}).get(key, True))
+
+    def hidden(self) -> set:
+        return set(self._cfg().get("computer_hidden") or [])
+
+    def places(self) -> list[dict]:
+        """Locais da barra lateral (sem os dispositivos, que têm cards próprios)."""
+        entries = [e for e in native.sidebar_places(self.ctl.win) if not e["device"]]
+        if not entries:
+            entries = fallback_places()
+        seen, out = set(), []
+        for e in entries:
+            if e["uri"] in seen:
+                continue
+            seen.add(e["uri"])
+            out.append(e)
+        return out
 
     def _on_hub_changed(self) -> None:
         self._dirty = True
@@ -772,42 +863,52 @@ class ComputerPage(Gtk.ScrolledWindow):
         self._dirty = False
         self._cancel.cancel()
         self._cancel = Gio.Cancellable()
-        for fb in (self.folders_box, self.devices_box, self.network_box):
+        for fb in self._boxes():
             fb.remove_all()
         self._cards.clear()
+        hidden = self.hidden()
+        counts = dict.fromkeys(self.sections, 0)
 
-        for special, icon, label in FOLDERS:
-            path = os.path.expanduser("~") if special is None else GLib.get_user_special_dir(special)
-            if not path or not os.path.isdir(path):
+        for entry in self.places():
+            if entry["uri"] in hidden:
                 continue
-            if special is not None and os.path.realpath(path) == os.path.realpath(os.path.expanduser("~")):
-                continue
-            self.folders_box.append(self._folder_tile(
-                Gio.File.new_for_path(path).get_uri(), icon, label or os.path.basename(path)))
+            key = "places" if entry["section"] == 1 else "bookmarks"
+            box = self.places_box if key == "places" else self.bookmarks_box
+            box.append(self._place_tile(entry))
+            counts[key] += 1
 
-        n_net = 0
         for dev in self.hub.devices():
+            if dev.key in hidden:
+                continue
             child = self._device_card(dev)
             self._cards[dev.key] = child
-            if dev.kind == "network":
-                self.network_box.append(child)
-                n_net += 1
-            else:
-                self.devices_box.append(child)
-        self.network_section.set_visible(n_net > 0)
+            key = "network" if dev.kind == "network" else "devices"
+            (self.network_box if key == "network" else self.devices_box).append(child)
+            counts[key] += 1
+
+        any_visible = False
+        for key, widget in self.sections.items():
+            show = counts[key] > 0 and self.section_enabled(key)
+            widget.set_visible(show)
+            any_visible = any_visible or show
+        self.disks_button.set_visible(self._has_disks_app and self.section_enabled("disks_button"))
+        self.empty_label.set_visible(not any_visible)
         self._refresh_usage()
 
-    def _folder_tile(self, uri: str, icon: str, label: str) -> Gtk.FlowBoxChild:
+    def _place_tile(self, entry: dict) -> Gtk.FlowBoxChild:
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         box.add_css_class("vitrine-tile")
-        img = Gtk.Image.new_from_icon_name(icon)
+        img = Gtk.Image.new_from_gicon(_color_icon(entry.get("gicon"), entry["uri"]))
         img.set_pixel_size(48)
-        lbl = Gtk.Label(label=label, ellipsize=Pango.EllipsizeMode.END, max_width_chars=12)
+        lbl = Gtk.Label(label=entry["label"], ellipsize=Pango.EllipsizeMode.END,
+                        max_width_chars=12)
         box.append(img)
         box.append(lbl)
         child = Gtk.FlowBoxChild()
         child.set_child(box)
-        child._vitrine_uri = uri
+        child.set_tooltip_text(entry["label"])
+        child._vitrine_uri = entry["uri"]
+        child._vitrine_label = entry["label"]
         child._vitrine_device = None
         self._add_context_menu(child)
         return child
@@ -949,7 +1050,7 @@ class ComputerPage(Gtk.ScrolledWindow):
         sel = fb.get_selected_children()
         if not sel:
             return
-        for other in (self.folders_box, self.devices_box, self.network_box):
+        for other in self._boxes():
             if other is not fb:
                 other.unselect_all()
         uri = getattr(sel[0], "_vitrine_uri", None)
@@ -1016,6 +1117,85 @@ class ComputerPage(Gtk.ScrolledWindow):
         else:
             mount.unmount_with_operation(Gio.MountUnmountFlags.NONE, op, None, done, False)
 
+    # ── personalização ──
+    def set_item_hidden(self, key: str, hide: bool) -> None:
+        hidden = self.hidden()
+        if hide:
+            hidden.add(key)
+        else:
+            hidden.discard(key)
+        self._cfg().set("computer_hidden", sorted(hidden))
+        self.ctl.ext.refresh_computer_pages()
+
+    def set_section_enabled(self, key: str, on: bool) -> None:
+        sections = dict(self._cfg().get("computer_sections") or {})
+        sections[key] = on
+        self._cfg().set("computer_sections", sections)
+        self.ctl.ext.refresh_computer_pages()
+
+    def open_settings(self) -> None:
+        """Escolher o que aparece no Meu computador e se o Nautilus abre direto nele."""
+        cfg = self._cfg()
+        dialog = Adw.PreferencesDialog(title="Personalizar o Meu computador")
+        dialog.set_search_enabled(True)
+        page = Adw.PreferencesPage(title="Meu computador", icon_name="computer-symbolic")
+        dialog.add(page)
+
+        def switch(group, title, subtitle, active, on_change):
+            row = Adw.SwitchRow(title=GLib.markup_escape_text(title),
+                                subtitle=GLib.markup_escape_text(subtitle or ""), active=active)
+            row.connect("notify::active", lambda r, _p: on_change(r.get_active()))
+            group.add(row)
+            return row
+
+        general = Adw.PreferencesGroup(title="Geral")
+        switch(general, "Abrir o Nautilus no Meu computador",
+               "Ao abrir o Arquivos pelo menu de aplicativos (ou uma janela nova), começar aqui",
+               bool(cfg.get("start_on_computer")), lambda v: cfg.set("start_on_computer", v))
+        switch(general, "Mostrar na barra lateral",
+               "Entrada \"Meu computador\" no topo da barra lateral",
+               bool(cfg.get("computer_in_sidebar")),
+               lambda v: (cfg.set("computer_in_sidebar", v), self.ctl.ext.refresh_computer_pages()))
+        switch(general, "Avisar quando um dispositivo for conectado",
+               "Pen drive, HD externo, cartão de memória, celular",
+               bool(cfg.get("notify_new_devices")), lambda v: cfg.set("notify_new_devices", v))
+        page.add(general)
+
+        sections = Adw.PreferencesGroup(title="Seções",
+                                        description="Quais blocos aparecem na página")
+        for key, title, subtitle in SECTIONS:
+            switch(sections, title, subtitle, self.section_enabled(key),
+                   lambda v, k=key: self.set_section_enabled(k, v))
+        page.add(sections)
+
+        hidden = self.hidden()
+        items = Adw.PreferencesGroup(title="Itens",
+                                     description="Desligue o que não quer ver no Meu computador")
+        for entry in self.places():
+            sub = "Marcador" if entry["section"] != 1 else "Local"
+            switch(items, entry["label"], sub, entry["uri"] not in hidden,
+                   lambda v, u=entry["uri"]: self.set_item_hidden(u, not v))
+        for dev in self.hub.devices():
+            switch(items, dev.name, "Dispositivo" if dev.kind != "network" else "Rede",
+                   dev.key not in hidden, lambda v, k=dev.key: self.set_item_hidden(k, not v))
+        page.add(items)
+
+        reset = Adw.PreferencesGroup()
+        btn = Gtk.Button(label="Mostrar tudo de novo", halign=Gtk.Align.CENTER)
+        btn.add_css_class("pill")
+
+        def do_reset(*_a):
+            cfg.set("computer_hidden", [])
+            cfg.set("computer_sections", {})
+            self.ctl.ext.refresh_computer_pages()
+            dialog.close()
+
+        btn.connect("clicked", do_reset)
+        reset.add(btn)
+        page.add(reset)
+        dialog.present(self.get_root())
+        self._settings_dialog = dialog
+
     def _launch(self, program: str) -> None:
         try:
             Gio.AppInfo.create_from_commandline(program, None, Gio.AppInfoCreateFlags.NONE).launch(
@@ -1059,6 +1239,12 @@ class ComputerPage(Gtk.ScrolledWindow):
             add(end, "Remover com segurança" if dev.mount.can_eject() else "Desmontar", "eject",
                 lambda: self.eject(dev))
             menu.append_section(None, end)
+        hide_key = dev.key if dev is not None else uri
+        if hide_key:
+            last = Gio.Menu()
+            add(last, "Ocultar do Meu computador", "hide", lambda: self.set_item_hidden(hide_key, True))
+            add(last, "Personalizar…", "customize", self.open_settings)
+            menu.append_section(None, last)
         child.insert_action_group("vcomp", group)
         pop = Gtk.PopoverMenu.new_from_model(menu)
         pop.set_parent(child)
@@ -1103,8 +1289,15 @@ DEFAULT_SETTINGS = {
     "auto_media_grid": True,
     "auto_media_zoom": "extra-large",
     "auto_media_ratio": 0.6,
-    # Abrir o Nautilus já na página "Meu computador".
+    # Abrir o Nautilus já na página "Meu computador" (quando abre na pasta pessoal,
+    # que é o que acontece pelo menu de aplicativos ou numa janela nova).
     "start_on_computer": False,
+    # Entrada "Meu computador" no topo da barra lateral.
+    "computer_in_sidebar": True,
+    # Seções desligadas: {"places": false, "bookmarks": ..., "devices": ..., "network": ...}
+    "computer_sections": {},
+    # Itens ocultos (URIs de locais/marcadores ou chaves de dispositivos).
+    "computer_hidden": [],
     # Avisar (com botão "Abrir") quando um pen drive/HD externo/cartão for conectado.
     "notify_new_devices": True,
     # Visualização para pastas sem regra. None = capturar do Nautilus na 1ª execução.
@@ -1561,6 +1754,10 @@ class VitrineExtension(GObject.GObject, Nautilus.MenuProvider):
             ctl = next(iter(self.windows.values()))
         return ctl
 
+    def refresh_computer_pages(self) -> None:
+        for ctl in list(self.windows.values()):
+            ctl.apply_computer_settings()
+
     def _on_new_device(self, key, name, mount, volume) -> None:
         """Avisa só na janela ativa (evita um aviso repetido por janela aberta)."""
         if not self.cfg.get("notify_new_devices"):
@@ -1726,6 +1923,46 @@ def open_location(slot, uri: str) -> bool:
     if slot is None:
         return False
     return bool(slot.activate_action("slot.open-location", GLib.Variant("s", uri)))
+
+
+# ── barra lateral nativa ──
+
+def _prop(obj, name):
+    try:
+        return obj.get_property(name)
+    except (TypeError, AttributeError):
+        return None
+
+
+def sidebar_places(win) -> list[dict]:
+    """Os locais da barra lateral do Nautilus, na mesma ordem e com os mesmos nomes.
+
+    Lê as propriedades de cada NautilusSidebarRow (uri, label, start-icon…).
+    Linhas de dispositivos (com mount/volume/drive) vêm marcadas em `device`."""
+    sidebar = find_first(win, lambda w: gtype_name(w) == "NautilusSidebar")
+    if sidebar is None:
+        return []
+    out = []
+    for row in walk(sidebar):
+        if gtype_name(row) != "NautilusSidebarRow":
+            continue
+        uri = _prop(row, "uri")
+        label = _prop(row, "label")
+        if not uri or not label or _prop(row, "placeholder"):
+            continue
+        if row.has_css_class("sidebar-new-bookmark-row"):
+            continue
+        device = any(_prop(row, p) is not None for p in ("mount", "volume", "drive"))
+        out.append({
+            "uri": uri,
+            "label": label,
+            "gicon": _prop(row, "start-icon"),
+            "section": int(_prop(row, "section-type") or 0),
+            "place": int(_prop(row, "place-type") or 0),
+            "device": device,
+            "visible": row.get_visible(),
+        })
+    return out
 
 
 # ── modo de visualização (lista/grade) ──
@@ -2637,14 +2874,25 @@ def run(ctl) -> bool:
     def c1():
         ctl.show_computer(True)
 
+    def tile_uris(page):
+        uris = []
+        for box in (page.places_box, page.bookmarks_box):
+            child = box.get_first_child()
+            while child is not None:
+                uris.append(getattr(child, "_vitrine_uri", None))
+                child = child.get_next_sibling()
+        return uris
+
     @step
     def c2():
         page = ctl.computer
-        tiles = 0
-        child = page.folders_box.get_first_child()
-        while child is not None:
-            tiles += 1
-            child = child.get_next_sibling()
+        uris = tile_uris(page)
+        tiles = len(uris)
+        sidebar = [e["uri"] for e in native.sidebar_places(ctl.win) if not e["device"]]
+        check("todos os locais da barra lateral aparecem (Recentes, Favoritos, Rede, Lixeira, marcadores)",
+              sidebar and all(u in uris for u in sidebar)
+              and all(s in uris for s in ("recent:///", "starred:///", "trash:///")),
+              f"barra lateral={len(sidebar)} página={tiles} faltando={[u for u in sidebar if u not in uris]}")
         system = page._cards.get("system:/")
         detail = system._vitrine_detail.get_text() if system is not None else ""
         check("Meu computador abre (Ctrl+Shift+C / barra lateral)",
@@ -2652,7 +2900,6 @@ def run(ctl) -> bool:
               and ctl.sidebar_list is not None
               and ctl.sidebar_list.get_selected_row() is not None,
               f"página={ctl.content_stack.get_visible_child_name()} sidebar={ctl.sidebar_list is not None}")
-        check("pastas pessoais aparecem", tiles >= 5, f"{tiles} pastas")
         check("disco do sistema mostra o uso de espaço",
               system is not None and system._vitrine_bar.get_value() > 0 and "livres" in detail,
               detail)
@@ -2691,6 +2938,55 @@ def run(ctl) -> bool:
         st = state()
         check("abrir o disco do sistema navega para /",
               ctl.content_stack.get_visible_child_name() == "tabs" and st["uri"] == "file:///",
+              str(st))
+        ctl.navigate(home)
+
+    @step
+    def c7():
+        ctl.show_computer(True)
+        page = ctl.computer
+        page.set_item_hidden("starred:///", True)
+        page.set_section_enabled("bookmarks", False)
+
+    @step
+    def c8():
+        page = ctl.computer
+        uris = tile_uris(page)
+        check("personalizar: ocultar item e seção",
+              "starred:///" not in uris and not page.sections["bookmarks"].get_visible()
+              and page.sections["places"].get_visible(),
+              f"itens={uris}")
+        page.set_item_hidden("starred:///", False)
+        page.set_section_enabled("bookmarks", True)
+        check("personalizar: mostrar de novo",
+              "starred:///" in tile_uris(page) and page.sections["bookmarks"].get_visible())
+        try:
+            page.open_settings()
+            dlg = page._settings_dialog
+            ok = dlg is not None and dlg.get_root() is not None
+            dlg.close()
+        except Exception as err:  # noqa: BLE001
+            ok = False
+            log(f"open_settings: {err!r}")
+        check("tela de personalização abre", ok)
+        cfg.settings["start_on_computer"] = True
+        project_dir = Gio.File.new_for_uri(project).get_uri()
+        check("opção abrir no Meu computador (só ao abrir na pasta pessoal)",
+              ctl.should_start_on_computer(home) and not ctl.should_start_on_computer(project_dir))
+        cfg.settings["start_on_computer"] = False
+        for box in (page.places_box,):
+            child = box.get_first_child()
+            while child is not None:
+                if getattr(child, "_vitrine_uri", None) == "recent:///":
+                    page.open_child(child)
+                    break
+                child = child.get_next_sibling()
+
+    @step
+    def c9():
+        st = state()
+        check("abrir Recentes pelo Meu computador",
+              ctl.content_stack.get_visible_child_name() == "tabs" and st["uri"] == "recent:///",
               str(st))
         ctl.navigate(home)
 
@@ -3083,9 +3379,27 @@ class WindowController:
         slot = self.active_slot()
         if slot is not None:
             self._on_slot_location(slot)
-        if self.cfg.get("start_on_computer"):
+        if self.should_start_on_computer(native.slot_uri(slot)):
             self.show_computer(True)
+            log("janela aberta direto no Meu computador")
         return GLib.SOURCE_REMOVE
+
+    def should_start_on_computer(self, uri: str | None) -> bool:
+        """Só quando a janela abriu na pasta pessoal (menu de aplicativos, Ctrl+N).
+        Se outro programa pediu uma pasta específica, ela é respeitada."""
+        if not self.cfg.get("start_on_computer") or not uri:
+            return False
+        home = Gio.File.new_for_path(os.path.expanduser("~"))
+        return Gio.File.new_for_uri(uri).equal(home)
+
+    def apply_computer_settings(self) -> None:
+        if self.sidebar_list is not None:
+            self.sidebar_list.set_visible(bool(self.cfg.get("computer_in_sidebar")))
+        if self.computer is not None:
+            if self.computer.get_mapped():
+                self.computer.refresh()
+            else:
+                self.computer._dirty = True
 
     def _inject_sidebar_row(self) -> None:
         """Entrada "Meu computador" no topo da barra lateral.
@@ -3111,6 +3425,7 @@ class WindowController:
         lb.connect("row-activated", lambda *_a: self.show_computer(True))
         tbv.add_top_bar(lb)
         self.sidebar_list = lb
+        lb.set_visible(bool(self.cfg.get("computer_in_sidebar")))
 
         # Clicar em qualquer local nativo da barra lateral sai do Meu computador,
         # mesmo que seja a pasta onde a aba já está (aí o Nautilus não navega).
@@ -3160,8 +3475,10 @@ class WindowController:
         self.navigate(uri)
 
     def preview_location(self, uri: str | None) -> None:
-        if self.preview is not None and self.preview.get_visible() and uri:
-            self.preview.show_uris([uri])
+        if self.preview is None or not self.preview.get_visible():
+            return
+        # Recentes, Favoritos, Rede e Lixeira não são pastas comuns: sem preview.
+        self.preview.show_uris([uri] if uri and native.is_regular_location(uri) else [])
 
     def toast(self, text: str, button_label: str | None = None, on_button=None,
               timeout: int = 5) -> None:
@@ -4010,7 +4327,7 @@ Clique com o botão direito no **fundo de qualquer pasta** e escolha **Visualiza
 
 Abra pela entrada **Meu computador** no topo da barra lateral, com **Ctrl+Shift+C** ou pelo clique direito no fundo de uma pasta.
 
-- **Pastas**: Pasta pessoal, Área de trabalho, Documentos, Downloads, Músicas, Imagens e Vídeos.
+- **Locais e Marcadores**: tudo o que está na barra lateral do Nautilus, com os mesmos nomes e na mesma ordem: Pasta pessoal, Recentes, Favoritos, Rede, Lixeira e as suas pastas fixadas (Downloads, Documentos, Projetos…). Fixou ou removeu uma pasta da barra lateral? O Meu computador acompanha.
 - **Dispositivos e unidades**: disco do sistema, outros discos, pen drives, HDs externos, cartões de memória e celulares, cada um com **barra de uso** (azul, laranja acima de 80%, vermelha acima de 92%) e "X livres de Y · sistema de arquivos". O uso é atualizado a cada 10 segundos enquanto a página está aberta.
 - **Rede**: compartilhamentos montados (SMB, SFTP, WebDAV…), quando houver.
 - **Dispositivos não montados** aparecem também. Ao abrir, a Vitrine monta o dispositivo e pede a senha se ele for criptografado.
@@ -4021,6 +4338,15 @@ Abra pela entrada **Meu computador** no topo da barra lateral, com **Ctrl+Shift+
 **Dispositivo novo conectado?** Assim que um pen drive, HD externo ou cartão é inserido, aparece um aviso na janela do Nautilus (*"Pen drive conectado — Abrir"*). O card dele ganha o selo **Novo**, fica destacado e já vem **selecionado** na página Meu computador.
 
 A página fecha sozinha quando você navega para qualquer lugar: barra lateral, barra de caminho, Voltar ou busca.
+
+**Personalizar:** o botão ✎ no topo da página (ou clique direito num item → *Personalizar…*) abre uma tela para:
+
+- **Abrir o Nautilus no Meu computador**: ao abrir o Arquivos pelo menu de aplicativos ou numa janela nova (Ctrl+N), ele começa aqui. Se outro programa pedir uma pasta específica, ela é respeitada.
+- Mostrar ou esconder a entrada **Meu computador na barra lateral**.
+- Ligar ou desligar o **aviso de dispositivo novo**.
+- Escolher quais **seções** aparecem: Locais, Marcadores, Dispositivos e unidades, Rede e o atalho para o Discos.
+- Escolher **item por item** o que aparece. Também dá para ocultar direto pelo clique direito → *Ocultar do Meu computador*.
+- **Mostrar tudo de novo**, com um clique.
 
 ---
 
@@ -4108,7 +4434,10 @@ Tudo funciona sem configurar nada. Para ajustes finos, edite os arquivos abaixo 
 | `auto_media_ratio` | `0.6` | Proporção mínima de mídia para considerar "pasta de fotos" |
 | `default_mode` | do Nautilus | Visualização das pastas sem regra: `list`, `grid` ou `columns` |
 | `default_grid_zoom` | do Nautilus | Zoom padrão dos ícones |
-| `start_on_computer` | `false` | Abrir o Nautilus já no Meu computador |
+| `start_on_computer` | `false` | Abrir o Nautilus já no Meu computador (quando abre na pasta pessoal) |
+| `computer_in_sidebar` | `true` | Entrada "Meu computador" no topo da barra lateral |
+| `computer_sections` | `{}` | Seções desligadas, ex.: `{"network": false}` (`places`, `bookmarks`, `devices`, `network`, `disks_button`) |
+| `computer_hidden` | `[]` | Itens ocultos: URIs de locais (`"trash:///"`) ou chaves de dispositivos |
 | `notify_new_devices` | `true` | Avisar quando um pen drive, HD externo ou cartão for conectado |
 
 **`~/.config/nautilus-vitrine/folders.json`** guarda as regras por pasta:
@@ -4173,7 +4502,7 @@ O projeto inclui tarefas do **VS Code** (*Terminal → Run Task*):
 | Tarefa | O que faz |
 |---|---|
 | **Ctrl+Shift+B** | Instala em modo dev e reinicia o Nautilus |
-| Autoteste dentro do Nautilus | 26 verificações automáticas: injeção, colunas, preview, regras por pasta, zoom, tempo de carregamento das imagens e Meu computador (página, uso de disco, aviso de dispositivo novo). Roda com regras temporárias; as suas e o zoom são restaurados no fim |
+| Autoteste dentro do Nautilus | 31 verificações automáticas: injeção, colunas, preview, regras por pasta, zoom, tempo de carregamento das imagens e Meu computador (locais da barra lateral, uso de disco, aviso de dispositivo novo, personalização, abrir direto nele). Roda com regras temporárias; as suas e o zoom são restaurados no fim |
 | Rodar em modo depuração | `VITRINE_DEBUG=1 VITRINE_DUMP=1 nautilus` (inclui a árvore de widgets da janela no log) |
 | Acompanhar log | `tail -f ~/.cache/nautilus-vitrine/vitrine.log` |
 | Teste fora do Nautilus | Abre colunas e preview numa janela própria |
@@ -4233,7 +4562,8 @@ Para lançar uma versão nova: aumente `Version` e acrescente uma entrada no `%c
 - [ ] Tocar vídeo e áudio direto no painel
 - [ ] Folhear páginas de PDF no painel
 - [ ] Dados EXIF da foto (câmera, lente, GPS)
-- [ ] Tela de preferências
+- [x] Tela de personalização do Meu computador
+- [ ] Tela de preferências geral (colunas, preview, regras por pasta)
 
 Sugestões e *pull requests* são bem-vindos.
 
@@ -4371,6 +4701,8 @@ install -p -m 0644 vitrine/*.py %{buildroot}%{extdir}/vitrine/
 * Wed Nov 11 2026 Vinicius Bispo - 0.2.0-1
 - Página "Meu computador" com pastas, discos e uso de espaço
 - Aviso ao conectar pen drive, HD externo ou cartão, com botão Abrir
+- Todos os locais da barra lateral (Recentes, Favoritos, Rede, Lixeira, marcadores)
+- Personalização (seções, itens, entrada na barra lateral) e opção de abrir direto nele
 
 * Wed Nov 11 2026 Vinicius Bispo - 0.1.0-1
 - Primeira versão: modo Colunas, painel de pré-visualização e visualização por pasta

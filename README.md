@@ -83,7 +83,7 @@ Clique com o botão direito no **fundo de qualquer pasta** e escolha **Visualiza
 
 Abra pela entrada **Meu computador** no topo da barra lateral, com **Ctrl+Shift+C** ou pelo clique direito no fundo de uma pasta.
 
-- **Pastas**: Pasta pessoal, Área de trabalho, Documentos, Downloads, Músicas, Imagens e Vídeos.
+- **Locais e Marcadores**: tudo o que está na barra lateral do Nautilus, com os mesmos nomes e na mesma ordem: Pasta pessoal, Recentes, Favoritos, Rede, Lixeira e as suas pastas fixadas (Downloads, Documentos, Projetos…). Fixou ou removeu uma pasta da barra lateral? O Meu computador acompanha.
 - **Dispositivos e unidades**: disco do sistema, outros discos, pen drives, HDs externos, cartões de memória e celulares, cada um com **barra de uso** (azul, laranja acima de 80%, vermelha acima de 92%) e "X livres de Y · sistema de arquivos". O uso é atualizado a cada 10 segundos enquanto a página está aberta.
 - **Rede**: compartilhamentos montados (SMB, SFTP, WebDAV…), quando houver.
 - **Dispositivos não montados** aparecem também. Ao abrir, a Vitrine monta o dispositivo e pede a senha se ele for criptografado.
@@ -94,6 +94,15 @@ Abra pela entrada **Meu computador** no topo da barra lateral, com **Ctrl+Shift+
 **Dispositivo novo conectado?** Assim que um pen drive, HD externo ou cartão é inserido, aparece um aviso na janela do Nautilus (*"Pen drive conectado — Abrir"*). O card dele ganha o selo **Novo**, fica destacado e já vem **selecionado** na página Meu computador.
 
 A página fecha sozinha quando você navega para qualquer lugar: barra lateral, barra de caminho, Voltar ou busca.
+
+**Personalizar:** o botão ✎ no topo da página (ou clique direito num item → *Personalizar…*) abre uma tela para:
+
+- **Abrir o Nautilus no Meu computador**: ao abrir o Arquivos pelo menu de aplicativos ou numa janela nova (Ctrl+N), ele começa aqui. Se outro programa pedir uma pasta específica, ela é respeitada.
+- Mostrar ou esconder a entrada **Meu computador na barra lateral**.
+- Ligar ou desligar o **aviso de dispositivo novo**.
+- Escolher quais **seções** aparecem: Locais, Marcadores, Dispositivos e unidades, Rede e o atalho para o Discos.
+- Escolher **item por item** o que aparece. Também dá para ocultar direto pelo clique direito → *Ocultar do Meu computador*.
+- **Mostrar tudo de novo**, com um clique.
 
 ---
 
@@ -181,7 +190,10 @@ Tudo funciona sem configurar nada. Para ajustes finos, edite os arquivos abaixo 
 | `auto_media_ratio` | `0.6` | Proporção mínima de mídia para considerar "pasta de fotos" |
 | `default_mode` | do Nautilus | Visualização das pastas sem regra: `list`, `grid` ou `columns` |
 | `default_grid_zoom` | do Nautilus | Zoom padrão dos ícones |
-| `start_on_computer` | `false` | Abrir o Nautilus já no Meu computador |
+| `start_on_computer` | `false` | Abrir o Nautilus já no Meu computador (quando abre na pasta pessoal) |
+| `computer_in_sidebar` | `true` | Entrada "Meu computador" no topo da barra lateral |
+| `computer_sections` | `{}` | Seções desligadas, ex.: `{"network": false}` (`places`, `bookmarks`, `devices`, `network`, `disks_button`) |
+| `computer_hidden` | `[]` | Itens ocultos: URIs de locais (`"trash:///"`) ou chaves de dispositivos |
 | `notify_new_devices` | `true` | Avisar quando um pen drive, HD externo ou cartão for conectado |
 
 **`~/.config/nautilus-vitrine/folders.json`** guarda as regras por pasta:
@@ -246,7 +258,7 @@ O projeto inclui tarefas do **VS Code** (*Terminal → Run Task*):
 | Tarefa | O que faz |
 |---|---|
 | **Ctrl+Shift+B** | Instala em modo dev e reinicia o Nautilus |
-| Autoteste dentro do Nautilus | 26 verificações automáticas: injeção, colunas, preview, regras por pasta, zoom, tempo de carregamento das imagens e Meu computador (página, uso de disco, aviso de dispositivo novo). Roda com regras temporárias; as suas e o zoom são restaurados no fim |
+| Autoteste dentro do Nautilus | 31 verificações automáticas: injeção, colunas, preview, regras por pasta, zoom, tempo de carregamento das imagens e Meu computador (locais da barra lateral, uso de disco, aviso de dispositivo novo, personalização, abrir direto nele). Roda com regras temporárias; as suas e o zoom são restaurados no fim |
 | Rodar em modo depuração | `VITRINE_DEBUG=1 VITRINE_DUMP=1 nautilus` (inclui a árvore de widgets da janela no log) |
 | Acompanhar log | `tail -f ~/.cache/nautilus-vitrine/vitrine.log` |
 | Teste fora do Nautilus | Abre colunas e preview numa janela própria |
@@ -306,7 +318,8 @@ Para lançar uma versão nova: aumente `Version` e acrescente uma entrada no `%c
 - [ ] Tocar vídeo e áudio direto no painel
 - [ ] Folhear páginas de PDF no painel
 - [ ] Dados EXIF da foto (câmera, lente, GPS)
-- [ ] Tela de preferências
+- [x] Tela de personalização do Meu computador
+- [ ] Tela de preferências geral (colunas, preview, regras por pasta)
 
 Sugestões e *pull requests* são bem-vindos.
 
