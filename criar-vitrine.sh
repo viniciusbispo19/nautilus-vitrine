@@ -882,9 +882,20 @@ CSS = b"""
 """
 
 
+_ACTIVE_INSTANCE = None
+
+
 class VitrineExtension(GObject.GObject, Nautilus.MenuProvider):
     def __init__(self) -> None:
+        global _ACTIVE_INSTANCE
         super().__init__()
+        # Instalada duas vezes (RPM em /usr/share + cópia de desenvolvimento em ~/.local)?
+        # O nautilus-python carrega as duas; só a primeira instância trabalha.
+        self._inert = _ACTIVE_INSTANCE is not None
+        if self._inert:
+            log("outra cópia da Vitrine já está ativa; esta instância fica inativa")
+            return
+        _ACTIVE_INSTANCE = self
         self.cfg = Config()
         self.windows: dict = {}
         self._suppress_until = 0.0
@@ -995,7 +1006,7 @@ class VitrineExtension(GObject.GObject, Nautilus.MenuProvider):
     @guarded
     def get_background_items(self, *args):
         folder = args[-1] if args else None
-        if folder is None:
+        if folder is None or self._inert:
             return []
         uri = folder.get_uri()
         if not native.is_regular_location(uri):
@@ -2853,6 +2864,9 @@ INCLUDE = [
     "README.md",
     "LICENSE",
     ".gitignore",
+    "Makefile",
+    "packaging",
+    ".copr",
 ]
 EXECUTABLE = {"install.sh", "uninstall.sh"}
 
@@ -2973,6 +2987,12 @@ if ! rpm -q nautilus-python >/dev/null 2>&1; then
     echo "Instale depois com: sudo dnf install nautilus-python"
     exit 1
   fi
+fi
+
+if rpm -q nautilus-vitrine >/dev/null 2>&1; then
+  echo "Aviso: o pacote RPM nautilus-vitrine também está instalado."
+  echo "Só uma cópia fica ativa (a primeira que o Nautilus carregar)."
+  echo "Para testar esta cópia de desenvolvimento: sudo dnf remove nautilus-vitrine"
 fi
 
 mkdir -p "$DEST"
@@ -3188,7 +3208,19 @@ Clique com o botão direito no **fundo de qualquer pasta** e escolha **Visualiza
 - **Nautilus 51** (GNOME 51, Fedora 45), versão em que a extensão foi testada. O Nautilus 50 (Fedora 44) tem a mesma estrutura de janela e deve funcionar, mas ainda não foi testado. Outras distribuições com essas versões também devem funcionar.
 - `nautilus-python` (o instalador oferece instalar).
 
-### Opção 1: clonar o repositório
+### Opção 1 (recomendada): pacote RPM pelo COPR
+
+```bash
+sudo dnf copr enable viniciusbispo19/nautilus-vitrine
+```
+
+```bash
+sudo dnf install nautilus-vitrine && nautilus -q
+```
+
+O `dnf` instala junto o `nautilus-python` e as demais dependências, e a Vitrine passa a receber atualizações junto com o resto do sistema (`sudo dnf upgrade`). Para remover: `sudo dnf remove nautilus-vitrine`.
+
+### Opção 2: clonar o repositório
 
 ```bash
 git clone https://github.com/viniciusbispo19/nautilus-vitrine.git
@@ -3200,7 +3232,7 @@ cd nautilus-vitrine && ./install.sh
 
 O `install.sh` instala o `nautilus-python` se faltar (pede sua senha), copia a extensão para `~/.local/share/nautilus-python/extensions/` e reinicia o Nautilus.
 
-### Opção 2: script único
+### Opção 3: script único
 
 O arquivo `criar-vitrine.sh` contém o projeto inteiro. Baixe-o e rode:
 
@@ -3212,13 +3244,15 @@ Ele cria a pasta `~/nautilus-vitrine` com todos os arquivos e já instala. Sem `
 
 ### Desinstalar
 
+Pelo pacote: `sudo dnf remove nautilus-vitrine`. Pelos scripts (opções 2 e 3):
+
 ```bash
 ./uninstall.sh
 ```
 
 O Nautilus volta exatamente ao original. Suas regras ficam guardadas; use `./uninstall.sh --purge` para apagar tudo.
 
-> **Não é uma extensão do GNOME Shell.** A Vitrine roda dentro do Nautilus, via nautilus-python, e por isso não aparece no app Extensões nem no extensions.gnome.org. Ela é gerenciada pelos scripts acima.
+> **Não é uma extensão do GNOME Shell.** A Vitrine roda dentro do Nautilus, via nautilus-python, e por isso não aparece no app Extensões nem no extensions.gnome.org. Ela é gerenciada pelo `dnf` ou pelos scripts acima.
 
 ---
 
@@ -3294,6 +3328,9 @@ vitrine/
 tools/
   smoke_test.py         teste das colunas e do preview fora do Nautilus
   build_bootstrap.py    gera o criar-vitrine.sh
+packaging/
+  nautilus-vitrine.spec receita do pacote RPM
+.copr/Makefile          build automático no COPR
 ```
 
 ---
@@ -3329,6 +3366,26 @@ Depois de alguns segundos, veja o resultado:
 grep SELFTEST ~/.cache/nautilus-vitrine/vitrine.log
 ```
 
+### Empacotamento (RPM / COPR)
+
+```bash
+sudo dnf install rpm-build python3-devel
+```
+
+```bash
+make rpm
+```
+
+O RPM sai em `dist/`; `make install-rpm` instala. A receita fica em `packaging/nautilus-vitrine.spec`.
+
+O COPR gera o pacote direto deste repositório usando `.copr/Makefile`. Configuração única em [copr.fedorainfracloud.org](https://copr.fedorainfracloud.org):
+
+1. Entre com a conta Fedora e crie o projeto `nautilus-vitrine`, marcando os *chroots* `fedora-45-x86_64` e `fedora-44-x86_64` (e outros que quiser).
+2. Em **Packages → New package → SCM**: *Clone URL* `https://github.com/viniciusbispo19/nautilus-vitrine`, *Spec file* `packaging/nautilus-vitrine.spec`, *SRPM build method* **make srpm**.
+3. Clique em **Rebuild**. Para gerar automaticamente a cada `git push`, ative o *webhook* do GitHub em **Settings → Integrations** do projeto COPR.
+
+Para lançar uma versão nova: aumente `Version` e acrescente uma entrada no `%changelog` do `.spec` (e o `VERSION` em `vitrine/main.py`), faça o commit e o push.
+
 ---
 
 ## Solução de problemas
@@ -3346,7 +3403,7 @@ grep SELFTEST ~/.cache/nautilus-vitrine/vitrine.log
 
 ## Próximos passos
 
-- [ ] Pacote RPM e repositório COPR (`dnf install`)
+- [x] Pacote RPM e build automático no COPR (`dnf install`)
 - [ ] Tocar vídeo e áudio direto no painel
 - [ ] Folhear páginas de PDF no painel
 - [ ] Dados EXIF da foto (câmera, lente, GPS)
@@ -3393,7 +3450,117 @@ cat > '.gitignore' <<'__VITRINE_ARQUIVO_20__'
 __pycache__/
 *.pyc
 *.tmp
+dist/
 __VITRINE_ARQUIVO_20__
+cat > 'Makefile' <<'__VITRINE_ARQUIVO_21__'
+# Empacotamento local.  Requer: sudo dnf install rpm-build python3-devel
+#
+#   make rpm        gera o RPM em dist/
+#   make srpm       gera só o SRPM (o mesmo que o COPR usa)
+#   make install-rpm  instala o RPM gerado (pede senha)
+#   make clean
+
+SPEC    := packaging/nautilus-vitrine.spec
+VERSION := $(shell awk '/^Version:/ {print $$2}' $(SPEC))
+DIST    := $(CURDIR)/dist
+TARBALL := $(DIST)/nautilus-vitrine-$(VERSION).tar.gz
+RPMDEFS := --define "_sourcedir $(DIST)" --define "_srcrpmdir $(DIST)" \
+           --define "_rpmdir $(DIST)" --define "_builddir $(DIST)/build" \
+           --define "_buildrootdir $(DIST)/buildroot"
+
+.PHONY: tarball srpm rpm install-rpm clean
+
+tarball:
+	mkdir -p $(DIST)
+	git archive --format=tar.gz --prefix=nautilus-vitrine-$(VERSION)/ -o $(TARBALL) HEAD
+
+srpm: tarball
+	rpmbuild -bs $(SPEC) $(RPMDEFS)
+
+rpm: tarball
+	rpmbuild -bb $(SPEC) $(RPMDEFS)
+	@find $(DIST) -name '*.noarch.rpm' -printf 'RPM: %p\n'
+
+install-rpm:
+	sudo dnf install -y $$(find $(DIST) -name 'nautilus-vitrine-$(VERSION)-*.noarch.rpm' | head -1)
+
+clean:
+	rm -rf $(DIST)
+__VITRINE_ARQUIVO_21__
+mkdir -p "packaging"
+cat > 'packaging/nautilus-vitrine.spec' <<'__VITRINE_ARQUIVO_22__'
+%global extdir %{_datadir}/nautilus-python/extensions
+
+Name:           nautilus-vitrine
+Version:        0.1.0
+Release:        1%{?dist}
+Summary:        Column view, preview pane and per-folder views for GNOME Files (Nautilus)
+
+License:        MIT
+URL:            https://github.com/viniciusbispo19/nautilus-vitrine
+Source0:        %{url}/archive/v%{version}/%{name}-%{version}.tar.gz
+
+BuildArch:      noarch
+BuildRequires:  python3-devel
+
+Requires:       nautilus >= 50
+Requires:       nautilus-python >= 4
+Requires:       python3-gobject
+Requires:       gtk4
+Requires:       libadwaita
+Recommends:     gnome-desktop4
+Recommends:     sushi
+
+%description
+Vitrine adds three Finder-inspired features to GNOME Files (Nautilus 50/51):
+
+ * Column view: parent folders are shown as columns on the left while the
+   current folder stays in Nautilus' own list view, so context menus, rename,
+   drag and drop, undo, scripts and other extensions keep working.
+ * Preview pane: images (fast loading with cache and prefetch), text, video
+   and PDF thumbnails, folder contents and file details next to the list.
+ * Per-folder views: each folder remembers list, icons, large icons or
+   columns, including the icon zoom; photo folders open in large icons.
+
+%prep
+%autosetup -n %{name}-%{version}
+
+%build
+# Python puro: nada para compilar.
+
+%install
+install -d %{buildroot}%{extdir}/vitrine
+install -p -m 0644 nautilus-vitrine.py %{buildroot}%{extdir}/
+install -p -m 0644 vitrine/*.py %{buildroot}%{extdir}/vitrine/
+%py_byte_compile %{python3} %{buildroot}%{extdir}/vitrine
+
+%files
+%license LICENSE
+%doc README.md
+%{extdir}/nautilus-vitrine.py
+%{extdir}/vitrine/
+
+%changelog
+* Wed Nov 11 2026 Vinicius Bispo - 0.1.0-1
+- Primeira versão: modo Colunas, painel de pré-visualização e visualização por pasta
+__VITRINE_ARQUIVO_22__
+mkdir -p ".copr"
+cat > '.copr/Makefile' <<'__VITRINE_ARQUIVO_23__'
+# Usado pelo COPR (método "make srpm"): gera o SRPM direto do repositório git.
+# O COPR chama:  make -f .copr/Makefile srpm outdir=<pasta> spec=<arquivo .spec>
+SPEC := packaging/nautilus-vitrine.spec
+
+srpm:
+	dnf -y install git rpm-build
+	git config --global --add safe.directory '*'
+	$(eval VERSION := $(shell awk '/^Version:/ {print $$2}' $(SPEC)))
+	mkdir -p $(outdir)
+	git archive --format=tar.gz --prefix=nautilus-vitrine-$(VERSION)/ \
+		-o $(outdir)/nautilus-vitrine-$(VERSION).tar.gz HEAD
+	rpmbuild -bs $(SPEC) \
+		--define "_sourcedir $(outdir)" \
+		--define "_srcrpmdir $(outdir)"
+__VITRINE_ARQUIVO_23__
 
 chmod +x install.sh uninstall.sh
 echo "Projeto criado em $TARGET"

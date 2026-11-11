@@ -29,9 +29,20 @@ CSS = b"""
 """
 
 
+_ACTIVE_INSTANCE = None
+
+
 class VitrineExtension(GObject.GObject, Nautilus.MenuProvider):
     def __init__(self) -> None:
+        global _ACTIVE_INSTANCE
         super().__init__()
+        # Instalada duas vezes (RPM em /usr/share + cópia de desenvolvimento em ~/.local)?
+        # O nautilus-python carrega as duas; só a primeira instância trabalha.
+        self._inert = _ACTIVE_INSTANCE is not None
+        if self._inert:
+            log("outra cópia da Vitrine já está ativa; esta instância fica inativa")
+            return
+        _ACTIVE_INSTANCE = self
         self.cfg = Config()
         self.windows: dict = {}
         self._suppress_until = 0.0
@@ -142,7 +153,7 @@ class VitrineExtension(GObject.GObject, Nautilus.MenuProvider):
     @guarded
     def get_background_items(self, *args):
         folder = args[-1] if args else None
-        if folder is None:
+        if folder is None or self._inert:
             return []
         uri = folder.get_uri()
         if not native.is_regular_location(uri):

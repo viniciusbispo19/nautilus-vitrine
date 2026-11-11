@@ -20,6 +20,9 @@ INCLUDE = [
     "README.md",
     "LICENSE",
     ".gitignore",
+    "Makefile",
+    "packaging",
+    ".copr",
 ]
 EXECUTABLE = {"install.sh", "uninstall.sh"}
 

@@ -87,7 +87,19 @@ Clique com o botão direito no **fundo de qualquer pasta** e escolha **Visualiza
 - **Nautilus 51** (GNOME 51, Fedora 45), versão em que a extensão foi testada. O Nautilus 50 (Fedora 44) tem a mesma estrutura de janela e deve funcionar, mas ainda não foi testado. Outras distribuições com essas versões também devem funcionar.
 - `nautilus-python` (o instalador oferece instalar).
 
-### Opção 1: clonar o repositório
+### Opção 1 (recomendada): pacote RPM pelo COPR
+
+```bash
+sudo dnf copr enable viniciusbispo19/nautilus-vitrine
+```
+
+```bash
+sudo dnf install nautilus-vitrine && nautilus -q
+```
+
+O `dnf` instala junto o `nautilus-python` e as demais dependências, e a Vitrine passa a receber atualizações junto com o resto do sistema (`sudo dnf upgrade`). Para remover: `sudo dnf remove nautilus-vitrine`.
+
+### Opção 2: clonar o repositório
 
 ```bash
 git clone https://github.com/viniciusbispo19/nautilus-vitrine.git
@@ -99,7 +111,7 @@ cd nautilus-vitrine && ./install.sh
 
 O `install.sh` instala o `nautilus-python` se faltar (pede sua senha), copia a extensão para `~/.local/share/nautilus-python/extensions/` e reinicia o Nautilus.
 
-### Opção 2: script único
+### Opção 3: script único
 
 O arquivo `criar-vitrine.sh` contém o projeto inteiro. Baixe-o e rode:
 
@@ -111,13 +123,15 @@ Ele cria a pasta `~/nautilus-vitrine` com todos os arquivos e já instala. Sem `
 
 ### Desinstalar
 
+Pelo pacote: `sudo dnf remove nautilus-vitrine`. Pelos scripts (opções 2 e 3):
+
 ```bash
 ./uninstall.sh
 ```
 
 O Nautilus volta exatamente ao original. Suas regras ficam guardadas; use `./uninstall.sh --purge` para apagar tudo.
 
-> **Não é uma extensão do GNOME Shell.** A Vitrine roda dentro do Nautilus, via nautilus-python, e por isso não aparece no app Extensões nem no extensions.gnome.org. Ela é gerenciada pelos scripts acima.
+> **Não é uma extensão do GNOME Shell.** A Vitrine roda dentro do Nautilus, via nautilus-python, e por isso não aparece no app Extensões nem no extensions.gnome.org. Ela é gerenciada pelo `dnf` ou pelos scripts acima.
 
 ---
 
@@ -193,6 +207,9 @@ vitrine/
 tools/
   smoke_test.py         teste das colunas e do preview fora do Nautilus
   build_bootstrap.py    gera o criar-vitrine.sh
+packaging/
+  nautilus-vitrine.spec receita do pacote RPM
+.copr/Makefile          build automático no COPR
 ```
 
 ---
@@ -228,6 +245,26 @@ Depois de alguns segundos, veja o resultado:
 grep SELFTEST ~/.cache/nautilus-vitrine/vitrine.log
 ```
 
+### Empacotamento (RPM / COPR)
+
+```bash
+sudo dnf install rpm-build python3-devel
+```
+
+```bash
+make rpm
+```
+
+O RPM sai em `dist/`; `make install-rpm` instala. A receita fica em `packaging/nautilus-vitrine.spec`.
+
+O COPR gera o pacote direto deste repositório usando `.copr/Makefile`. Configuração única em [copr.fedorainfracloud.org](https://copr.fedorainfracloud.org):
+
+1. Entre com a conta Fedora e crie o projeto `nautilus-vitrine`, marcando os *chroots* `fedora-45-x86_64` e `fedora-44-x86_64` (e outros que quiser).
+2. Em **Packages → New package → SCM**: *Clone URL* `https://github.com/viniciusbispo19/nautilus-vitrine`, *Spec file* `packaging/nautilus-vitrine.spec`, *SRPM build method* **make srpm**.
+3. Clique em **Rebuild**. Para gerar automaticamente a cada `git push`, ative o *webhook* do GitHub em **Settings → Integrations** do projeto COPR.
+
+Para lançar uma versão nova: aumente `Version` e acrescente uma entrada no `%changelog` do `.spec` (e o `VERSION` em `vitrine/main.py`), faça o commit e o push.
+
 ---
 
 ## Solução de problemas
@@ -245,7 +282,7 @@ grep SELFTEST ~/.cache/nautilus-vitrine/vitrine.log
 
 ## Próximos passos
 
-- [ ] Pacote RPM e repositório COPR (`dnf install`)
+- [x] Pacote RPM e build automático no COPR (`dnf install`)
 - [ ] Tocar vídeo e áudio direto no painel
 - [ ] Folhear páginas de PDF no painel
 - [ ] Dados EXIF da foto (câmera, lente, GPS)

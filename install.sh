@@ -29,6 +29,12 @@ if ! rpm -q nautilus-python >/dev/null 2>&1; then
   fi
 fi
 
+if rpm -q nautilus-vitrine >/dev/null 2>&1; then
+  echo "Aviso: o pacote RPM nautilus-vitrine também está instalado."
+  echo "Só uma cópia fica ativa (a primeira que o Nautilus carregar)."
+  echo "Para testar esta cópia de desenvolvimento: sudo dnf remove nautilus-vitrine"
+fi
+
 mkdir -p "$DEST"
 rm -rf "$DEST/vitrine" "$DEST/nautilus-vitrine.py"
 if [[ "$MODE" == "link" ]]; then
